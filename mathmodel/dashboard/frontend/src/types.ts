@@ -161,6 +161,7 @@ export interface ProviderSettings {
 }
 
 export interface RunDetail extends RunSummary {
+  files?: string[]
   plan: string
   plan_tasks: PlanTask[]
   problem: string

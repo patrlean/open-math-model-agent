@@ -129,6 +129,7 @@ function DraftLoadingRing() {
 function buildMessages(events: AgentEvent[]): Message[] {
   const messages: Message[] = []
   let activeAssistant: Message | undefined
+  let rollingAssistant: Message | undefined
   let sawFirstTask = false
 
   for (const event of events) {
@@ -136,7 +137,10 @@ function buildMessages(events: AgentEvent[]): Message[] {
       // The very first task is already shown in the "你的任务" card above the
       // timeline; only a continued conversation's follow-up messages appear
       // here, as their own bubbles.
-      if (sawFirstTask) messages.push({ kind: 'user', text: event.task, ts: event.ts })
+      if (sawFirstTask) {
+        rollingAssistant = undefined
+        messages.push({ kind: 'user', text: event.task, ts: event.ts })
+      }
       sawFirstTask = true
       continue
     }
@@ -159,7 +163,7 @@ function buildMessages(events: AgentEvent[]): Message[] {
     }
     if (event.subagent != null) continue
     if (event.kind === 'assistant') {
-      activeAssistant = {
+      const assistant: Message = {
         kind: 'assistant',
         text: event.text,
         reasoning: event.reasoning_text,
@@ -170,7 +174,29 @@ function buildMessages(events: AgentEvent[]): Message[] {
           .filter(([name]) => name !== 'spawn_subagent')
           .map(([name, args]) => ({ name, args })),
       }
-      messages.push(activeAssistant)
+      const hasResponse = Boolean(assistant.text?.trim())
+      const hasActivity = Boolean(
+        assistant.reasoning?.trim() || assistant.calls?.length,
+      )
+      if (!hasResponse && !hasActivity) {
+        activeAssistant = undefined
+        continue
+      }
+      if (hasResponse) {
+        // A visible response closes the current rolling activity window. Keep
+        // the most recent pre-response reasoning/tool group in history, then
+        // render the response as its own fixed message.
+        rollingAssistant = undefined
+      } else if (rollingAssistant) {
+        // Until a response exists, only the newest reasoning/tool group is
+        // useful to the user. Replace the previous rolling entry in place in
+        // the projected timeline instead of accumulating every model step.
+        const rollingIndex = messages.indexOf(rollingAssistant)
+        if (rollingIndex >= 0) messages.splice(rollingIndex, 1)
+      }
+      messages.push(assistant)
+      activeAssistant = assistant
+      if (!hasResponse) rollingAssistant = assistant
     } else if (event.kind === 'tool_result' && event.name !== 'spawn_subagent') {
       const call = activeAssistant?.calls?.find((item) => item.result == null)
       if (call) call.result = event.observation
@@ -204,8 +230,10 @@ function buildMessages(events: AgentEvent[]): Message[] {
         issues: event.issues ?? [],
       })
     } else if (event.kind === 'done') {
+      rollingAssistant = undefined
       messages.push({ kind: 'done', text: event.text, ts: event.ts })
     } else if (event.kind === 'max_steps') {
+      rollingAssistant = undefined
       messages.push({ kind: 'stopped' })
     }
   }
@@ -385,7 +413,20 @@ function VerificationNotice({ message, onOpenVerification }: { message: Message;
 
 export function RunTimeline({ run, onOpenVerification }: { run: RunDetail; onOpenVerification: () => void }) {
   const messages = buildMessages(run.events)
-  if (messages.length === 0) {
+  const initialTaskCandidate = (
+    run.task
+    || run.events.find((event) => event.kind === 'task' && event.subagent == null)?.task
+    || ''
+  ).trim()
+  const initialTask = initialTaskCandidate === 'Solve the modeling problem.'
+    ? ''
+    : initialTaskCandidate
+  const initialFiles = run.files ?? []
+  const initialCopyText = [
+    initialTask,
+    initialFiles.length > 0 ? `材料：${initialFiles.join('、')}` : '',
+  ].filter(Boolean).join('\n')
+  if (messages.length === 0 && !initialTask && initialFiles.length === 0) {
     const emptyIcon = run.status === 'draft'
       ? <DraftLoadingRing />
       : run.status === 'running'
@@ -395,7 +436,23 @@ export function RunTimeline({ run, onOpenVerification }: { run: RunDetail; onOpe
   }
   return (
     <section className="timeline">
-      {run.task && <article className="task-brief copyable-message user-copyable"><span>你的任务</span><p>{run.task}</p><div className="message-actions"><CopyMessageButton text={run.task} idleLabel="复制任务" /></div></article>}
+      {(initialTask || initialFiles.length > 0) && (
+        <article className="task-brief copyable-message user-copyable">
+          <span>你的任务</span>
+          {initialTask && <p>{initialTask}</p>}
+          {initialFiles.length > 0 && (
+            <div className="task-files" aria-label="首轮材料">
+              {initialFiles.map((file) => <small key={file}>{file}</small>)}
+            </div>
+          )}
+          <div className="message-actions">
+            <CopyMessageButton
+              text={initialCopyText}
+              idleLabel={initialTask ? '复制任务' : '复制材料列表'}
+            />
+          </div>
+        </article>
+      )}
       {(run.status === 'error' || run.status === 'stopped' || run.status === 'cancelled') && (
         <article className="run-recovery-notice">
           <strong>
