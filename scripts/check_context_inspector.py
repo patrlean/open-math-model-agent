@@ -116,15 +116,38 @@ def main() -> None:
         assert records[0]["context"]["agent_role"] == "Main Agent"
         assert records[0]["context"]["system_prompt_source"] == "agent.md"
 
-        first_categories = {
-            item["category"] for item in classify_request(records[0])
-        }
+        first_items = classify_request(records[0])
+        first_categories = {item["category"] for item in first_items}
         assert {
             "system_prompt",
             "working_memory",
             "user_input",
             "tool_definition",
         }.issubset(first_categories)
+        first_order = [item["category"] for item in first_items]
+        assert first_order.index("system_prompt") < first_order.index(
+            "working_memory"
+        )
+        assert first_order.index("working_memory") < first_order.index(
+            "tool_definition"
+        )
+        assert first_order.index("tool_definition") < first_order.index(
+            "user_input"
+        )
+        for role in ("Main Agent", "Subagent 1", "Verification Agent"):
+            role_record = {
+                **records[0],
+                "context": {
+                    **records[0]["context"],
+                    "agent_role": role,
+                },
+            }
+            role_order = [
+                item["category"] for item in classify_request(role_record)
+            ]
+            assert role_order.index("working_memory") + 1 == role_order.index(
+                "tool_definition"
+            )
 
         second = request_detail(records[1])
         second_categories = {item["category"] for item in second["items"]}

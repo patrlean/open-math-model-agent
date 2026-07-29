@@ -138,11 +138,23 @@ def classify_request(record: dict[str, Any]) -> list[dict[str, Any]]:
     """Flatten an OpenAI-style request into readable context categories."""
     params = record.get("params") or {}
     messages = params.get("messages") or []
+    tools = params.get("tools") or []
     context = record.get("context") or {}
     system_source = str(
         context.get("system_prompt_source") or "Agent system prompt"
     )
     items: list[dict[str, Any]] = []
+    tool_definitions = (
+        _item(
+            category="tool_definition",
+            label=f"Available Tool Definitions · {len(tools)}",
+            content=tools,
+            source="Request tools parameter",
+        )
+        if tools
+        else None
+    )
+    tool_definitions_inserted = False
 
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -172,6 +184,9 @@ def classify_request(record: dict[str, Any]) -> list[dict[str, Any]]:
                     message_index=index,
                     source="Regenerated working memory",
                 ))
+                if tool_definitions is not None:
+                    items.append(tool_definitions)
+                    tool_definitions_inserted = True
             else:
                 items.append(_item(
                     category="system_instruction",
@@ -255,14 +270,21 @@ def classify_request(record: dict[str, Any]) -> list[dict[str, Any]]:
             message_index=index,
         ))
 
-    tools = params.get("tools") or []
-    if tools:
-        items.append(_item(
-            category="tool_definition",
-            label=f"Available Tool Definitions · {len(tools)}",
-            content=tools,
-            source="Request tools parameter",
-        ))
+    # OpenAI-compatible APIs carry tool definitions in the request's top-level
+    # ``tools`` field rather than inside ``messages``. The inspector presents
+    # them at their logical context position: directly after regenerated
+    # working memory and before the user input. Requests without working memory
+    # retain a safe fallback immediately after the system prompt.
+    if tool_definitions is not None and not tool_definitions_inserted:
+        system_prompt_index = next(
+            (
+                index
+                for index, item in enumerate(items)
+                if item["category"] == "system_prompt"
+            ),
+            -1,
+        )
+        items.insert(system_prompt_index + 1, tool_definitions)
 
     request_parameters = {
         key: value

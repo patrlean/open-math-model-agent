@@ -533,6 +533,11 @@ def run_detail(run_id: str) -> dict:
         "id": run_id,
         "name": _resolved_run_name(d, m),
         "task": m.get("task", ""),
+        "files": [
+            str(name)
+            for name in (m.get("files") or [])
+            if isinstance(name, str)
+        ],
         "created": m.get("created"),
         "status": status,
         "plan": _read(d / "plan.md"),

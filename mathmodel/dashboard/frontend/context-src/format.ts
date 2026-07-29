@@ -19,13 +19,13 @@ export const categoryMeta: Record<
 export const filterCategories: ContextCategory[] = [
   'system_prompt',
   'working_memory',
+  'tool_definition',
   'system_instruction',
   'user_input',
   'assistant_response',
   'reasoning',
   'tool_call',
   'tool_result',
-  'tool_definition',
   'metadata',
 ]
 
