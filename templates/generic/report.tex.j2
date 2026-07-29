@@ -1,0 +1,39 @@
+%% Generic modeling-report template (rendered by mathmodel/latex/render.py).
+%% Set cjk=true in the context to typeset Chinese (uses ctex + fandol fonts,
+%% which tectonic fetches automatically -- no system-font dependency).
+\BLOCK{if cjk}
+\documentclass[11pt]{ctexart}
+\BLOCK{else}
+\documentclass[11pt]{article}
+\BLOCK{endif}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+% Resolve figures whether the body writes figures/foo.png or just foo.png.
+\graphicspath{{../}{../figures/}{./}{figures/}}
+\usepackage{booktabs}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+
+\title{\VAR{title}}
+\author{\VAR{author}}
+\date{\VAR{date}}
+
+\begin{document}
+\maketitle
+\BLOCK{if abstract}
+\begin{abstract}
+\VAR{abstract}
+\BLOCK{if keywords}
+
+\noindent\textbf{Keywords:} \VAR{keywords}
+\BLOCK{endif}
+\end{abstract}
+\clearpage
+\BLOCK{endif}
+
+\BLOCK{for s in sections}
+\section{\VAR{s.heading}}
+\VAR{s.body}
+
+\BLOCK{endfor}
+\end{document}

@@ -1,0 +1,49 @@
+# mathmodel-agent configuration
+# Secrets (API keys) live in .env, not here.
+
+provider: deepseek
+model: deepseek-v4-pro          # verified via scripts/check_provider.py (also: deepseek-v4-flash)
+base_url: https://api.deepseek.com
+
+context:
+  compact_threshold_tokens: 1000000   # compact when the CURRENT context window (last prompt_tokens) reaches this; must be < model max context
+  token_source: api_usage             # tokens read from each response's usage field
+
+pricing:
+  # Current DeepSeek plan, CNY per 1M tokens. Other providers remain unpriced
+  # until their rates are explicitly configured.
+  deepseek_cny_per_million:
+    cached_input: 0.025
+    uncached_input: 3.0
+    output: 6.0
+
+web_search:
+  # auto uses Brave when BRAVE_SEARCH_API_KEY exists, otherwise DuckDuckGo HTML.
+  provider: auto
+  max_results: 8
+  timeout_seconds: 20
+
+verification:
+  enabled: true
+  max_attempts: 3
+  # Each REVISE verdict starts a separate repair phase instead of consuming
+  # only the original 80-step modeling budget.
+  repair_steps_per_attempt: 48
+  # One independent verifier owns the complete review and can use up to this
+  # many steps, including its final structured verdict.
+  max_steps: 80
+  # Optional: use a different configured provider/model for less correlated review.
+  provider_config: {}
+
+paper:
+  target_pages: 20
+  min_pages: 17
+  max_pages: 20
+  abstract_cjk_min_chars: 800
+  abstract_english_min_words: 450
+  abstract_fill_min_ratio: 0.72
+  min_display_equations: 12
+  figures_english_only: true
+
+sandbox: docker
+template: generic

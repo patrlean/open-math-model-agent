@@ -1,0 +1,24 @@
+# secrets
+.env
+.env.*
+!.env.example
+.provider-settings.json
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# per-run outputs
+workspace/
+
+# temporary and local runtime files
+tmp/
+*.log
+
+# frontend dependencies
+node_modules/
+
+# macOS
+.DS_Store

@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-label="Agent 正在思考">
+  <style>
+    .ring-dark, .ring-light { transform-box: view-box; transform-origin: 50% 50%; }
+    .ring-dark { animation: dark-half-turn 2.8s cubic-bezier(.32, 0, .18, 1) infinite; }
+    .ring-light { animation: light-half-turn 2.8s cubic-bezier(.32, 0, .18, 1) infinite; }
+    @keyframes dark-half-turn {
+      0%, 5% { transform: rotate(0deg); }
+      27%, 55% { transform: rotate(180deg); }
+      77%, 100% { transform: rotate(360deg); }
+    }
+    @keyframes light-half-turn {
+      0%, 30% { transform: rotate(0deg); }
+      52%, 80% { transform: rotate(180deg); }
+      100% { transform: rotate(360deg); }
+    }
+    @media (prefers-reduced-motion: reduce) { .ring-dark, .ring-light { animation: none; } }
+  </style>
+
+  <!-- The outside edge stays circular while the inside edge moves outward at
+       both ends. That produces a continuous, hand-drawn taper rather than a
+       uniform SVG stroke. -->
+  <g id="loading-ring-dark" class="ring-dark" fill="#252629">
+    <path d="M 10.1 33.9 A 43 43 0 1 1 41.1 92 Q 41.8 92.2 41.4 90.3 C 42 88.3 45.3 86.7 50 86 A 36 36 0 1 0 20.2 29.9 C 17 30.9 13.5 32.5 11.7 34.6 Q 10.4 35.1 10.1 33.9 Z"/>
+  </g>
+
+  <g id="loading-ring-light" class="ring-light" fill="#a4a6aa">
+    <path d="M 81.1 28.2 A 38 38 0 1 1 24.1 22.2 Q 24.6 22 25.3 23.5 C 24.8 26.3 23.5 29.4 22.6 30.8 A 33.5 33.5 0 1 0 80.8 36.9 C 80.9 34.1 79.9 31.2 79.7 29.2 Q 80.1 28.2 81.1 28.2 Z"/>
+  </g>
+</svg>
