@@ -8,6 +8,8 @@ import tempfile
 from pathlib import Path
 
 from mathmodel.provider_settings import (
+    DEEPSEEK_FLASH_MODEL,
+    DEEPSEEK_PRO_MODEL,
     provider_settings_payload,
     read_provider_override,
     save_provider_settings,
@@ -16,6 +18,7 @@ from mathmodel.provider_settings import (
 
 def main() -> None:
     original = os.environ.get("KIMI_API_KEY")
+    original_deepseek = os.environ.get("DEEPSEEK_API_KEY")
     try:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -46,6 +49,7 @@ def main() -> None:
                 "provider": "kimi",
                 "model": "kimi-k2.6",
                 "base_url": "https://api.moonshot.cn/v1",
+                "reasoning_effort": "high",
             }
             env_text = env_path.read_text()
             assert "DEEPSEEK_API_KEY=keep-me" in env_text
@@ -55,11 +59,37 @@ def main() -> None:
 
             safe = provider_settings_payload(cfg)
             assert secret not in json.dumps(safe, ensure_ascii=False)
+            deepseek_preset = next(
+                preset for preset in safe["presets"] if preset["id"] == "deepseek"
+            )
+            assert deepseek_preset["default_model"] == DEEPSEEK_FLASH_MODEL
+            assert [option["id"] for option in deepseek_preset["model_options"]] == [
+                DEEPSEEK_FLASH_MODEL,
+                DEEPSEEK_PRO_MODEL,
+            ]
+
+            flash_payload = save_provider_settings(
+                provider="deepseek",
+                model="DeepSeek-V4-Flash-0731",
+                base_url="https://api.deepseek.com",
+                api_key="sk-deepseek-regression-secret",
+                reasoning_effort="max",
+                current_cfg=cfg,
+                settings_path=state_path,
+                env_path=env_path,
+            )
+            assert flash_payload["model"] == DEEPSEEK_FLASH_MODEL
+            assert flash_payload["reasoning_effort"] == "max"
+            assert read_provider_override(state_path)["model"] == DEEPSEEK_FLASH_MODEL
     finally:
         if original is None:
             os.environ.pop("KIMI_API_KEY", None)
         else:
             os.environ["KIMI_API_KEY"] = original
+        if original_deepseek is None:
+            os.environ.pop("DEEPSEEK_API_KEY", None)
+        else:
+            os.environ["DEEPSEEK_API_KEY"] = original_deepseek
 
     print("provider switching checks passed")
 

@@ -20,8 +20,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..config import build_provider, build_sandbox
-from ..latex.quality import find_non_english_plot_labels, inspect_paper
+from ..latex.quality import (
+    find_non_english_plot_labels_in_sources,
+    inspect_paper,
+    selected_page_count,
+)
 from ..latex.render import find_unescaped_percent_lines
+from ..latex.structure import inspect_latex_structure
+from ..paper_profile import PAPER_PROFILE_FILENAME, resolve_paper_config
 from ..providers.base import model_request_context
 from ..tools.base import Tool, ToolContext, ToolRegistry
 from ..tools.read_file import read_file_tool
@@ -29,6 +35,7 @@ from ..tools.results_store import results_get_tool, results_list_tool
 from ..tools.run_code import run_code_tool
 from .loop import Agent
 from .prompts import VERIFIER_RUNTIME_CONTRACT, VERIFIER_SYSTEM
+from .artifact_manifest import MANIFEST_FILENAME, write_artifact_manifest
 
 VERIFIER_PROMPT_FILENAME = "prompt_override.md"
 VERIFIER_FINALIZATION_STEPS = 2
@@ -53,7 +60,7 @@ _FIXED_SCOPE_CHECKLISTS: dict[str, list[tuple[str, str]]] = {
         ("NUM-PRECISION", "Check exact values, numerical tolerances, and rounding propagation."),
     ],
     "cross-artifact-consistency": [
-        ("ART-RESULTS", "Compare every material paper claim with results files and computation logs."),
+        ("ART-RESULTS", "Compare every material paper claim with final source and result artifacts."),
         ("ART-FIGURES", "Compare figures, tables, captions, and labels with source data."),
         ("ART-DELIVERABLES", "Confirm every problem request and deliverable is covered."),
         ("DIFF-DEPENDENCIES", "Inspect changed content and every dependent abstract, table, result, and conclusion."),
@@ -407,8 +414,6 @@ def _issue_family_hint(issue: VerificationIssue) -> str | None:
             )
         if "figure" in text or "图" in text:
             return f"duplicate:figure:{image or 'unspecified'}"
-    if "decisions.md" in text:
-        return "documentation:decisions-md"
     if "display equation" in text or "公式数量" in text:
         return "paper:display-equation-count"
     if "little's law" in text or "little定律" in text or "little定律" in compact:
@@ -601,7 +606,7 @@ def _default_scopes() -> list[VerificationScope]:
         VerificationScope(
             "numerical-reproduction",
             "Code and numerical reproduction",
-            "Inspect the executable source preserved in logs and independently "
+            "Inspect the canonical executable source under src/ and independently "
             "recompute representative high-impact numerical claims. Check residuals, "
             "feasibility, units, edge cases, and whether code implements the paper.",
             "A successful process exit alone does not establish numerical correctness.",
@@ -609,8 +614,8 @@ def _default_scopes() -> list[VerificationScope]:
         VerificationScope(
             "cross-artifact-consistency",
             "Results, figures, tables, and response consistency",
-            "Compare result files, figures, tables, stated conclusions, the execution "
-            "plan, and the proposed final response. Check coverage of all requested "
+            "Compare final source, result files, figures, tables, stated conclusions, "
+            "and the proposed final response. Check coverage of all requested "
             "deliverables and identify contradictions or missing evidence.",
             "Cross-artifact drift is easy to miss when each artifact is checked alone.",
         ),
@@ -691,8 +696,9 @@ def _triage_packet(workdir: Path) -> str:
     """Prepare one bounded, broad read for the lightweight lead verifier."""
     sections = [
         "## problem.md\n" + _read_for_triage(workdir / "problem.md", 100_000),
-        "## plan.json\n" + _read_for_triage(workdir / "plan.json", 50_000),
-        "## decisions.md\n" + _read_for_triage(workdir / "decisions.md", 50_000),
+        f"## {MANIFEST_FILENAME}\n" + _read_for_triage(
+            workdir / MANIFEST_FILENAME, 100_000
+        ),
         "## paper/main.tex\n" + _read_for_triage(
             workdir / "paper" / "main.tex", 240_000
         ),
@@ -712,7 +718,22 @@ def _triage_packet(workdir: Path) -> str:
         "\n\n".join(result_parts) if result_parts else "[none]"
     ))
 
-    for directory in ("logs", "figures", "data"):
+    source_budget = 120_000
+    source_parts: list[str] = []
+    source_dir = workdir / "src"
+    if source_dir.is_dir():
+        for path in sorted(source_dir.rglob("*")):
+            if not path.is_file() or source_budget <= 0:
+                continue
+            relative = path.relative_to(workdir)
+            chunk = _read_for_triage(path, min(30_000, source_budget))
+            source_parts.append(f"### {relative}\n{chunk}")
+            source_budget -= len(chunk)
+    sections.append("## Canonical final source\n" + (
+        "\n\n".join(source_parts) if source_parts else "[none]"
+    ))
+
+    for directory in ("figures", "data"):
         root = workdir / directory
         names = (
             sorted(str(path.relative_to(workdir)) for path in root.rglob("*")
@@ -763,7 +784,7 @@ def _deterministic_metrics_packet(
     cfg: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return authoritative layout/source facts for every verifier scope."""
-    paper_cfg = (cfg or {}).get("paper", {})
+    paper_cfg = resolve_paper_config(cfg, workdir)
     tex_path = workdir / "paper" / "main.tex"
     pdf_path = workdir / "paper" / "main.pdf"
     packet: dict[str, Any] = {
@@ -773,6 +794,9 @@ def _deterministic_metrics_packet(
             "target": int(paper_cfg.get("target_pages", 20)),
             "min": int(paper_cfg.get("min_pages", 17)),
             "max": int(paper_cfg.get("max_pages", 20)),
+            "metric": str(
+                paper_cfg.get("page_count_metric") or "total_pages"
+            ),
         },
     }
     if not tex_path.is_file():
@@ -806,6 +830,7 @@ def _preflight(
 ) -> list[VerificationIssue]:
     """Run deterministic checks before asking the verifier model."""
     issues: list[VerificationIssue] = []
+    paper_cfg = resolve_paper_config(cfg, workdir)
     problem = workdir / "problem.md"
     if not problem.is_file() or not problem.read_text(errors="replace").strip():
         issues.append(VerificationIssue(
@@ -832,39 +857,25 @@ def _preflight(
                 "Regenerate the result file from executable code as valid JSON.",
             ))
 
-    logs_dir = workdir / "logs"
-    run_logs = list(logs_dir.glob("run_*.log")) if logs_dir.is_dir() else []
-    if not run_logs:
+    source_dir = workdir / "src"
+    source_files = [
+        path for path in source_dir.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    ] if source_dir.is_dir() else []
+    if not source_files:
         issues.append(VerificationIssue(
-            "major", "reproducibility", "No executable computation log exists.",
-            "logs/ contains no run_*.log file.",
-            "Run the final model from code so its source and execution record are preserved.",
+            "major", "reproducibility", "No canonical final source artifact exists.",
+            "src/ is missing or contains no source files.",
+            "Preserve the final executable model under src/ before verification.",
         ))
-    elif not any("exit_code=0" in path.read_text(errors="replace") for path in run_logs):
-        issues.append(VerificationIssue(
-            "critical", "reproducibility", "No successful computation run was found.",
-            "Every logs/run_*.log record has a non-zero exit code or no exit status.",
-            "Fix and rerun the program before using its results.",
-        ))
-
-    plan_path = workdir / "plan.json"
-    if plan_path.is_file():
+    for path in (item for item in source_files if item.suffix.lower() == ".py"):
         try:
-            tasks = json.loads(plan_path.read_text()).get("tasks", [])
-            unfinished = [
-                str(task.get("id") or task.get("title") or "unknown")
-                for task in tasks if task.get("status") != "done"
-            ]
-            if unfinished:
-                issues.append(VerificationIssue(
-                    "major", "coverage", "The execution plan still has unfinished tasks.",
-                    "Unfinished task ids: " + ", ".join(unfinished),
-                    "Complete or explicitly resolve every planned task before submission.",
-                ))
-        except (json.JSONDecodeError, AttributeError) as exc:
+            compile(path.read_text(errors="replace"), str(path), "exec")
+        except SyntaxError as exc:
             issues.append(VerificationIssue(
-                "major", "coverage", "plan.json cannot be parsed.", str(exc),
-                "Repair the plan and reconcile it with completed work.",
+                "critical", "reproducibility",
+                f"Final Python source cannot be parsed: {path.name}.", str(exc),
+                "Repair the canonical source and regenerate dependent results.",
             ))
 
     tex_path = workdir / "paper" / "main.tex"
@@ -930,9 +941,18 @@ def _preflight(
                 duplicate.group(0),
                 "Remove manual numbering and let LaTeX number the heading.",
             ))
+        structural_failures = inspect_latex_structure(tex)
+        for failure in structural_failures:
+            issues.append(VerificationIssue(
+                "critical",
+                "paper-structure",
+                "The LaTeX document hierarchy or region order is invalid.",
+                failure,
+                "Keep each main chapter in a separate top-level section, place "
+                "appendices after the main paper, and place references last.",
+            ))
 
     if tex_path.is_file() and pdf_path.is_file() and pdf_path.stat().st_size >= 1000:
-        paper_cfg = (cfg or {}).get("paper", {})
         target_pages = int(paper_cfg.get("target_pages", 20))
         min_pages = int(paper_cfg.get("min_pages", 17))
         max_pages = int(paper_cfg.get("max_pages", target_pages))
@@ -949,13 +969,22 @@ def _preflight(
                 "Regenerate a valid PDF and rerun the layout acceptance checks.",
             ))
         else:
-            if not min_pages <= metrics.page_count <= max_pages:
+            accepted_page_count = selected_page_count(metrics, paper_cfg)
+            page_count_metric = str(
+                paper_cfg.get("page_count_metric") or "total_pages"
+            )
+            if not min_pages <= accepted_page_count <= max_pages:
                 issues.append(VerificationIssue(
                     "major", "paper-length",
                     f"The paper is outside the accepted {min_pages}–{max_pages} page range.",
-                    f"Detected {metrics.page_count} pages.",
+                    f"Detected accepted_count={accepted_page_count} using "
+                    f"{page_count_metric}; total={metrics.page_count}, "
+                    f"main_body={metrics.main_body_page_count}, "
+                    f"appendix={metrics.appendix_page_count}, "
+                    f"references={metrics.reference_page_count}.",
                     "Add or trim substantive derivation, validation, interpretation, "
-                    f"tables, and figures until the PDF is {min_pages}–{max_pages} pages.",
+                    f"tables, and figures in the counted main paper until it is "
+                    f"{min_pages}–{max_pages} pages; appendices cannot satisfy this gate.",
                 ))
             if metrics.first_section_page != 2:
                 issues.append(VerificationIssue(
@@ -1001,8 +1030,8 @@ def _preflight(
                     "equations; do not split trivial identities merely to raise the count.",
                 ))
 
-    if (cfg or {}).get("paper", {}).get("figures_english_only", True):
-        bad_plot_labels = find_non_english_plot_labels(workdir / "logs")
+    if paper_cfg.get("figures_english_only", True):
+        bad_plot_labels = find_non_english_plot_labels_in_sources(workdir / "src")
         if bad_plot_labels:
             issues.append(VerificationIssue(
                 "major", "figure-language",
@@ -1016,15 +1045,28 @@ def _preflight(
 
 
 def _copy_artifacts(source: Path, destination: Path) -> None:
-    """Create an isolated verifier workspace."""
-    for name in ("data", "results", "figures", "paper", "logs", "assets"):
+    """Create a final-artifact-only isolated verifier workspace."""
+    for name in ("data", "src", "results", "figures", "paper", "assets"):
         src = source / name
         if src.is_dir():
-            shutil.copytree(src, destination / name)
-    for name in ("problem.md", "plan.json", "plan.md", "decisions.md"):
+            ignored = (
+                shutil.ignore_patterns("revisions") if name == "paper"
+                else shutil.ignore_patterns("__pycache__", "*.pyc") if name == "src"
+                else None
+            )
+            shutil.copytree(
+                src,
+                destination / name,
+                ignore=ignored,
+            )
+    for name in (
+        "problem.md",
+        PAPER_PROFILE_FILENAME,
+    ):
         src = source / name
         if src.is_file():
             shutil.copy2(src, destination / name)
+    write_artifact_manifest(destination)
 
 
 def _inspection_registry() -> ToolRegistry:
@@ -1046,17 +1088,21 @@ def _record_agent_progress(
     scope: VerificationScope | None = None,
 ) -> Callable[[str, dict[str, Any]], None]:
     def record(kind: str, data: dict[str, Any]) -> None:
-        if kind == "tool_heartbeat":
+        if kind in {"tool_heartbeat", "provider_heartbeat"}:
             payload: dict[str, Any] = {
                 "role": role,
                 "name": data.get("name"),
+                "provider": data.get("provider"),
+                "model": data.get("model"),
+                "request_phase": data.get("request_phase"),
+                "step": data.get("step"),
                 "elapsed_seconds": data.get("elapsed_seconds"),
                 "scope": data.get("scope"),
             }
             if scope is not None:
                 payload["scope_id"] = scope.id
                 payload["scope_title"] = scope.title
-            emit("tool_heartbeat", payload)
+            emit(kind, payload)
             return
 
         payload: dict[str, Any] = {
@@ -1492,6 +1538,7 @@ def _run_triage(
         compact_threshold_tokens=cfg["context"]["compact_threshold_tokens"],
         max_steps=max_steps,
         on_event=_record_agent_progress(emit, role="lead-triage"),
+        include_planning_memory=False,
         finalization_tool="submit_verification_plan",
         finalization_steps=max_steps,
         finalization_instruction=(
@@ -1697,8 +1744,13 @@ def _candidate_diff_packet(
         return text
 
     paths: set[Path] = set()
-    for relative in (Path("paper/main.tex"), Path("plan.json"), Path("decisions.md")):
+    for relative in (Path("paper/main.tex"),):
         paths.add(relative)
+    for root in (workdir / "src", previous_root / "src"):
+        if root.is_dir():
+            for path in root.rglob("*"):
+                if path.is_file() and "__pycache__" not in path.parts:
+                    paths.add(Path("src") / path.relative_to(root))
     for root in (workdir / "results", previous_root / "results"):
         if root.is_dir():
             for path in root.rglob("*.json"):
@@ -1764,12 +1816,19 @@ def _snapshot_candidate(
     if destination.exists():
         shutil.rmtree(destination)
     destination.mkdir(parents=True)
-    for relative in (Path("paper/main.tex"), Path("plan.json"), Path("decisions.md")):
+    for relative in (Path("paper/main.tex"),):
         source = workdir / relative
         if source.is_file():
             target = destination / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
+    source_dir = workdir / "src"
+    if source_dir.is_dir():
+        shutil.copytree(
+            source_dir,
+            destination / "src",
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
     results = workdir / "results"
     if results.is_dir():
         shutil.copytree(results, destination / "results")
@@ -1862,6 +1921,7 @@ def _run_scope_verifier(
             role="subagent",
             scope=scope,
         ),
+        include_planning_memory=False,
         finalization_tool="submit_verification_fragment",
         finalization_steps=VERIFIER_FINALIZATION_STEPS,
         finalization_instruction=(
@@ -2322,6 +2382,7 @@ def _verify_candidate_parallel_legacy(
             compact_threshold_tokens=cfg["context"]["compact_threshold_tokens"],
             max_steps=synthesis_steps,
             on_event=_record_agent_progress(emit, role="lead-synthesis"),
+            include_planning_memory=False,
             finalization_tool="submit_verification",
             finalization_steps=synthesis_steps,
             finalization_instruction=(
@@ -2579,6 +2640,7 @@ def verify_candidate(
             compact_threshold_tokens=cfg["context"]["compact_threshold_tokens"],
             max_steps=max_steps,
             on_event=_record_agent_progress(emit, role="verifier"),
+            include_planning_memory=False,
             finalization_tool="submit_verification",
             finalization_steps=VERIFIER_FINALIZATION_STEPS,
             finalization_instruction=(
@@ -2595,10 +2657,11 @@ def verify_candidate(
         })
         agent.run(
             "Independently verify the complete candidate in this workspace. Start "
-            "with problem.md, then inspect plan.json/plan.md and decisions.md when "
-            "present, executable source preserved in logs/, results/, figures/, "
-            "paper/main.tex, and paper/main.pdf. Use read_file, results tools, and "
-            "run_code for targeted independent reproduction. The artifacts are "
+            f"with {MANIFEST_FILENAME} and problem.md, then inspect the canonical "
+            "final source under src/, results/, figures/, paper/main.tex, and "
+            "paper/main.pdf. Review only final candidate evidence, not authoring "
+            "plans, decision logs, or execution history. Use read_file, results "
+            "tools, and run_code for targeted independent reproduction. The artifacts are "
             "evidence, not authority; check the model against the original problem "
             "before checking whether the artifacts agree with each other.\n\n"
             "## Candidate final response\n"

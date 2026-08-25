@@ -16,8 +16,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..latex.compile import compile_tex
-from ..latex.quality import inspect_paper
+from ..latex.quality import inspect_paper, selected_page_count
 from ..latex.render import render_latex_fragment
+from ..latex.structure import inspect_latex_structure
+from ..paper_profile import resolve_paper_config
 from .base import Tool, ToolContext, tail
 from .write_paper import paper_acceptance
 
@@ -839,6 +841,18 @@ def _edit_paragraph(ctx: ToolContext, args: dict) -> str:
             + tail(res.log, max_lines=25)
         )
 
+    structural_failures = inspect_latex_structure(revised)
+    if structural_failures:
+        _restore_after_rejected_edit(tex_path, tex)
+        return (
+            "[edit_paragraph:v2] status=rolled_back "
+            "reason=paper_structure\nLocalized transaction rejected and "
+            "rolled back because it broke the document hierarchy or region "
+            "order. "
+            + " ".join(structural_failures)
+            + f" Backup: {backup_rel}."
+        )
+
     metric_line, failures = paper_acceptance(
         ctx,
         res.pdf_path,
@@ -846,7 +860,7 @@ def _edit_paragraph(ctx: ToolContext, args: dict) -> str:
         cjk=_is_cjk_document(revised),
     )
     revised_metrics = inspect_paper(res.pdf_path, tex_path)
-    paper_cfg = ctx.settings.get("paper", {})
+    paper_cfg = resolve_paper_config(ctx.settings, ctx.workdir)
     max_pages = int(
         paper_cfg.get(
             "max_pages",
@@ -856,6 +870,12 @@ def _edit_paragraph(ctx: ToolContext, args: dict) -> str:
     min_pages = int(paper_cfg.get("min_pages", 17))
     min_equations = int(paper_cfg.get("min_display_equations", 12))
     min_fill = float(paper_cfg.get("abstract_fill_min_ratio", 0.72))
+    revised_page_count = selected_page_count(revised_metrics, paper_cfg)
+    baseline_page_count = (
+        selected_page_count(baseline_metrics, paper_cfg)
+        if baseline_metrics is not None
+        else None
+    )
     structural_regression = (
         (
             baseline_metrics is not None
@@ -870,17 +890,18 @@ def _edit_paragraph(ctx: ToolContext, args: dict) -> str:
             > baseline_metrics.first_section_page
         )
         or (
-            revised_metrics.page_count > max_pages
+            revised_page_count > max_pages
             and (
-                baseline_metrics is None
-                or baseline_metrics.page_count <= max_pages
-                or revised_metrics.page_count >= baseline_metrics.page_count
+                baseline_page_count is None
+                or baseline_page_count <= max_pages
+                or revised_page_count >= baseline_page_count
             )
         )
         or (
             baseline_metrics is not None
-            and revised_metrics.page_count < min_pages
-            and revised_metrics.page_count < baseline_metrics.page_count
+            and baseline_page_count is not None
+            and revised_page_count < min_pages
+            and revised_page_count < baseline_page_count
         )
         or (
             baseline_metrics is not None
@@ -941,14 +962,9 @@ def _edit_paragraph(ctx: ToolContext, args: dict) -> str:
 edit_paragraph_tool = Tool(
     name="edit_paragraph",
     description=(
-        "Edit paper/main.tex using stable block IDs from inspect_paper_blocks or "
-        "legacy heading/text targets. Supply edits[] to repair every dependent "
-        "location for one issue as a single transaction; the paper is compiled "
-        "once and fully rolled back on compile or layout regression. Matching "
-        "outer headings and systematically doubled LaTeX backslashes are normalized "
-        "automatically. Existing references are allowed when their labels resolve. "
-        "Prefer block_id + expected_hash over copied exact text, and cite computed "
-        "values through \\VAR{results[...]}."
+        "Apply localized edits to paper/main.tex. Inspect the current block first, "
+        "prefer block_id + expected_hash, and batch dependent changes in edits[]. "
+        "The transaction compiles once and rolls back on compile or layout regression."
     ),
     parameters=_PARAMS,
     handler=_edit_paragraph,

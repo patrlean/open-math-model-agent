@@ -20,6 +20,7 @@ from typing import Any
 
 import yaml
 
+from ..paper_profile import activate_paper_profile
 from .base import Tool, ToolContext, tail
 
 SKILLS_ROOT = Path(__file__).resolve().parent.parent.parent / "skills"
@@ -102,9 +103,33 @@ def make_load_skill_tool(root: Path = SKILLS_ROOT) -> Tool:
         if skill_dir is None:
             available = ", ".join(s.name for s in discover_skills(root)) or "(none)"
             return f"[error] unknown skill '{name}'. Available: {available}"
-        _, body = _parse_frontmatter((skill_dir / "SKILL.md").read_text(errors="replace"))
+        meta, body = _parse_frontmatter(
+            (skill_dir / "SKILL.md").read_text(errors="replace")
+        )
         others = _list_other_files(skill_dir)
         out = body
+        if "paper" in meta:
+            profile = activate_paper_profile(
+                ctx.workdir,
+                skill=name,
+                paper=meta.get("paper"),
+            )
+            if profile is None:
+                out = (
+                    "[paper profile warning] This skill's paper frontmatter is "
+                    "invalid; global page defaults remain active.\n\n" + out
+                )
+            else:
+                out = (
+                    "[active paper profile] "
+                    f"target={profile['target_pages']} pages; accepted range="
+                    f"{profile['min_pages']}-{profile['max_pages']} pages; "
+                    f"template={profile.get('template', 'generic')}; "
+                    f"page_count_metric={profile.get('page_count_metric', 'total_pages')}. "
+                    "This profile is persisted for paper writing, editing, and "
+                    "verification after resume.\n\n"
+                    + out
+                )
         if others:
             out += (
                 "\n\n---\n[other files in this skill, fetch with "

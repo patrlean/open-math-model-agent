@@ -1,6 +1,7 @@
 """Deterministic self-test for the Task 4 context-management mechanics (no network):
   - plan_write / set_task_status / log_decision write files
-  - working memory re-surfaces the todo plan + decisions + results index
+  - lead working memory re-surfaces the todo plan + decisions + results index
+  - verifier working memory excludes plan and decision-log content
   - compaction collapses old turns while keeping tool_call/tool pairing intact
 
 Run:  ./.venv/bin/python -m scripts.check_context
@@ -43,6 +44,13 @@ def main() -> None:
         ]})
         set_task_status_tool.handler(ctx, {"id": "q1", "status": "done", "result": "loaded 50 rows"})
         log_decision_tool.handler(ctx, {"what": "ruled out exact MILP", "why": ">2h on full instance"})
+        # Keep enough subsequent entries to push the first decision beyond the
+        # old 20-line tail. Working memory must preserve the complete log.
+        for index in range(25):
+            log_decision_tool.handler(ctx, {
+                "what": f"later decision {index}",
+                "why": f"evidence {index}",
+            })
         assert (wd / "plan.json").exists() and (wd / "plan.md").exists() and (wd / "decisions.md").exists()
         (wd / "results").mkdir()
         (wd / "results" / "fit.json").write_text(json.dumps({"a": 1}))
@@ -54,10 +62,29 @@ def main() -> None:
         agent._refresh_working_memory()
         wm = agent.messages[1]["content"]
         assert "fit model" in wm and "loaded 50 rows" in wm and "☑" in wm \
-            and "ruled out exact MILP" in wm and "results/fit.json" in wm
-        print("[2] working memory re-surfaces todo (with status) + decisions + results OK")
+            and "ruled out exact MILP" in wm and "later decision 24" in wm \
+            and "results/fit.json" in wm
+        print("[2] working memory re-surfaces todo + complete decisions + results OK")
 
-        # 3) compaction: build a long history with tool pairing, force compaction
+        # 3) Verification must judge artifacts independently: its pinned system
+        # memory keeps artifact indexes but omits the author's plan and rationale.
+        verifier = Agent(
+            FakeProvider(),
+            ToolRegistry(),
+            ctx,
+            "VERIFIER SYS",
+            include_planning_memory=False,
+        )
+        verifier._refresh_working_memory()
+        verifier_wm = verifier.messages[1]["content"]
+        assert "## Plan" not in verifier_wm
+        assert "fit model" not in verifier_wm
+        assert "## Decisions" not in verifier_wm
+        assert "ruled out exact MILP" not in verifier_wm
+        assert "results/fit.json" in verifier_wm
+        print("[3] verifier working memory excludes plan + decisions, keeps artifact indexes OK")
+
+        # 4) compaction: build a long history with tool pairing, force compaction
         agent.messages = agent.messages[:2] + [{"role": "user", "content": "task"}]
         for i in range(8):
             agent.messages.append({"role": "assistant", "content": None,
@@ -82,7 +109,7 @@ def main() -> None:
                 open_ids = {c["id"] for c in m.get("tool_calls", [])}
             elif m["role"] == "tool":
                 assert m["tool_call_id"] in open_ids, "orphan tool message after compaction"
-        print(f"[3] compaction {before}->{after} msgs, tool pairing intact, summary called={FakeProvider is not None}")
+        print(f"[4] compaction {before}->{after} msgs, tool pairing intact, summary called={FakeProvider is not None}")
 
     print("\nOK: context-management mechanics pass.")
 

@@ -14,9 +14,54 @@ import json
 import time
 
 from ..latex.compile import compile_tex
-from ..latex.quality import find_non_english_plot_labels, inspect_paper
+from ..latex.quality import (
+    find_non_english_plot_labels,
+    inspect_paper,
+    selected_page_count,
+)
 from ..latex.render import find_unescaped_percent_lines, render_report
+from ..latex.structure import inspect_latex_structure, validate_document_regions
+from ..paper_profile import active_paper_profile, resolve_paper_config
 from .base import Tool, ToolContext, tail
+
+_SECTION_BLOCK = {
+    "type": "object",
+    "properties": {
+        "heading": {
+            "type": "string",
+            "description": (
+                "Unnumbered, problem-specific title chosen freely by the writer. "
+                "Do not include a chapter or section number."
+            ),
+        },
+        "body": {
+            "type": "string",
+            "description": (
+                "Substantive LaTeX body for this top-level region. It may contain "
+                "subsection/subsubsection commands but never section, appendix, "
+                "bibliography, document-class, or document-boundary commands."
+            ),
+        },
+    },
+    "required": ["heading", "body"],
+}
+
+_REFERENCE = {
+    "type": "object",
+    "properties": {
+        "key": {
+            "type": "string",
+            "description": "Unique LaTeX citation key, for example smith2024.",
+        },
+        "text": {
+            "type": "string",
+            "description": (
+                "Complete verified reference text without a bibitem command."
+            ),
+        },
+    },
+    "required": ["key", "text"],
+}
 
 _PARAMS = {
     "type": "object",
@@ -32,39 +77,59 @@ _PARAMS = {
         },
         "keywords": {"type": "string"},
         "cjk": {"type": "boolean", "description": "true to typeset Chinese."},
-        "template": {"type": "string", "description": "template name (default 'generic')."},
+        "template": {
+            "type": "string",
+            "description": (
+                "Compatibility override used only when no active competition "
+                "writing skill has locked its own template."
+            ),
+        },
         "sections": {
             "type": "array",
-            "description": "Ordered sections. Bodies are LaTeX; cite computed "
-            "values with \\VAR{results['file']['key']}. LaTeX numbers section "
-            "commands automatically: headings must contain title text only, "
-            "without prefixes such as 2, 2.5, 2.5.1, 二、, or 第二章.",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "heading": {
-                        "type": "string",
-                        "description": (
-                            "Unnumbered title text only. Do not include a chapter or "
-                            "section number; the template adds it automatically."
-                        ),
-                    },
-                    "body": {
-                        "type": "string",
-                        "description": (
-                            "Substantive LaTeX section body. Problem Analysis must "
-                            "explain mathematical structure and method rationale; "
-                            "model sections must include auditable derivation, "
-                            "equations, conditions, objective, and constraints."
-                        ),
-                    },
-                },
-                "required": ["heading", "body"],
-            },
+            "description": (
+                "Ordered main-paper sections of any count and with freely chosen "
+                "headings. Each array item becomes exactly one numbered LaTeX "
+                "section. Cite computed values with "
+                "\\VAR{results['file']['key']}."
+            ),
+            "items": _SECTION_BLOCK,
+        },
+        "appendices": {
+            "type": "array",
+            "description": (
+                "Optional appendices of any count. The template places them after "
+                "the main paper and excludes them from counted competition pages."
+            ),
+            "items": _SECTION_BLOCK,
+        },
+        "references": {
+            "type": "array",
+            "description": (
+                "Optional verified references. The template emits bibitems and "
+                "always places this region last."
+            ),
+            "items": _REFERENCE,
         },
     },
     "required": ["title", "sections"],
 }
+
+
+def resolve_paper_template(ctx: ToolContext, args: dict) -> str:
+    """Select the active skill template, with a generic compatibility fallback."""
+    paper_cfg = resolve_paper_config(ctx.settings, ctx.workdir)
+    active_profile = active_paper_profile(ctx.workdir)
+    return str(
+        (
+            active_profile.get("paper", {}).get("template")
+            if active_profile is not None
+            else None
+        )
+        or args.get("template")
+        or paper_cfg.get("template")
+        or ctx.settings.get("template")
+        or "generic"
+    )
 
 
 def paper_acceptance(
@@ -75,7 +140,7 @@ def paper_acceptance(
     cjk: bool,
 ) -> tuple[str, list[str]]:
     """Run the shared post-compile paper checks used by all paper tools."""
-    paper_cfg = ctx.settings.get("paper", {})
+    paper_cfg = resolve_paper_config(ctx.settings, ctx.workdir)
     target_pages = int(paper_cfg.get("target_pages", 20))
     min_pages = int(paper_cfg.get("min_pages", 17))
     max_pages = int(paper_cfg.get("max_pages", target_pages))
@@ -84,6 +149,10 @@ def paper_acceptance(
     min_fill = float(paper_cfg.get("abstract_fill_min_ratio", 0.72))
     min_equations = int(paper_cfg.get("min_display_equations", 12))
     metrics = inspect_paper(pdf_path, tex_path)
+    accepted_page_count = selected_page_count(metrics, paper_cfg)
+    page_count_metric = str(
+        paper_cfg.get("page_count_metric") or "total_pages"
+    )
     failures: list[str] = []
     bare_percent_lines = find_unescaped_percent_lines(
         tex_path.read_text(errors="replace")
@@ -94,10 +163,17 @@ def paper_acceptance(
             "paper source contains unescaped percent signs that comment out the "
             "rest of a prose line: " + "; ".join(bare_percent_lines[:8])
         )
-    if not min_pages <= metrics.page_count <= max_pages:
+    failures.extend(inspect_latex_structure(
+        tex_path.read_text(errors="replace")
+    ))
+    if not min_pages <= accepted_page_count <= max_pages:
         failures.append(
-            f"paper has {metrics.page_count} pages; accepted range is "
-            f"{min_pages}-{max_pages}"
+            f"paper has {accepted_page_count} accepted-count pages using "
+            f"{page_count_metric}; accepted range is {min_pages}-{max_pages} "
+            f"(total PDF pages={metrics.page_count}, main-body pages="
+            f"{metrics.main_body_page_count}, appendix pages="
+            f"{metrics.appendix_page_count}, reference pages="
+            f"{metrics.reference_page_count})"
         )
     if metrics.first_section_page != 2:
         failures.append(
@@ -133,7 +209,12 @@ def paper_acceptance(
             )
 
     metric_line = (
-        f"pages={metrics.page_count}, first_section_page="
+        f"pages={metrics.page_count}, counted_pages={metrics.counted_page_count}, "
+        f"main_body_pages={metrics.main_body_page_count}, appendix_pages="
+        f"{metrics.appendix_page_count}, reference_pages="
+        f"{metrics.reference_page_count}, page_count_metric={page_count_metric}, "
+        f"accepted_count={accepted_page_count}, target_pages={target_pages}, "
+        f"accepted_pages={min_pages}-{max_pages}, first_section_page="
         f"{metrics.first_section_page}, abstract_fill="
         f"{metrics.abstract_fill_ratio:.0%}, display_equations="
         f"{metrics.display_equation_count}"
@@ -151,14 +232,33 @@ def _write_paper(ctx: ToolContext, args: dict) -> str:
         "keywords": args.get("keywords", ""),
         "cjk": bool(args.get("cjk", False)),
         "sections": args["sections"],
+        "appendices": args.get("appendices", []),
+        "references": args.get("references", []),
     }
-    template = args.get("template", "generic")
+    structure_failures = validate_document_regions(context)
+    if structure_failures:
+        return (
+            "[paper structure error]\n"
+            + "\n".join(f"- {failure}" for failure in structure_failures)
+        )
+
+    paper_cfg = resolve_paper_config(ctx.settings, ctx.workdir)
+    template = resolve_paper_template(ctx, args)
 
     try:
         tex = render_report(context, workdir=ctx.workdir, template=template)
     except Exception as e:
         # Most often a \VAR reference to a result key that does not exist.
         return f"[render error] {type(e).__name__}: {e}\n(check that referenced results exist via results_list)"
+
+    rendered_structure_failures = inspect_latex_structure(tex)
+    if rendered_structure_failures:
+        return (
+            "[paper structure error after render]\n"
+            + "\n".join(
+                f"- {failure}" for failure in rendered_structure_failures
+            )
+        )
 
     tex_path = paper_dir / "main.tex"
     pdf_path = paper_dir / "main.pdf"
@@ -203,13 +303,20 @@ def _write_paper(ctx: ToolContext, args: dict) -> str:
         )
         if failures:
             revised_metrics = inspect_paper(res.pdf_path, tex_path)
+            baseline_page_count = (
+                selected_page_count(baseline_metrics, paper_cfg)
+                if baseline_metrics is not None
+                else None
+            )
+            revised_page_count = selected_page_count(revised_metrics, paper_cfg)
             severe_regression = bool(
                 baseline_metrics is not None
                 and (
                     (
-                        baseline_metrics.page_count >= 5
-                        and revised_metrics.page_count
-                        < max(4, int(baseline_metrics.page_count * 0.6))
+                        baseline_page_count is not None
+                        and baseline_page_count >= 5
+                        and revised_page_count
+                        < max(4, int(baseline_page_count * 0.6))
                     )
                     or (
                         baseline_metrics.display_equation_count >= 4
@@ -260,11 +367,11 @@ def _write_paper(ctx: ToolContext, args: dict) -> str:
 
 write_paper_tool = Tool(
     name="write_paper",
-    description="Render the paper template with the given title/abstract/sections "
-    "(citing computed values via \\VAR{results[...]}) and compile it to PDF. "
-    "Section numbers are generated automatically; never put numbers in headings. "
-    "Compilation is followed by hard page-count, abstract-page, equation-density, "
-    "and figure-language acceptance checks.",
+    description="Render the active competition template from flexible main "
+    "sections, optional appendices, and final references, then compile it to "
+    "PDF. Section names and counts are writer-defined; each sections item becomes "
+    "one top-level section. Compilation is followed by hard hierarchy, region "
+    "order, counted-page, abstract, equation-density, and figure-language checks.",
     parameters=_PARAMS,
     handler=_write_paper,
 )

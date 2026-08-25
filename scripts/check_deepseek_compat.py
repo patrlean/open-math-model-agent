@@ -65,6 +65,8 @@ def _provider(completions: _FakeCompletions) -> DeepSeekProvider:
     provider.client = SimpleNamespace(
         chat=SimpleNamespace(completions=completions)
     )
+    provider.pricing = {}
+    provider.reasoning_effort = "high"
     return provider
 
 

@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import json
 
-from .base import Tool, ToolContext, tail
+from .base import Tool, ToolContext
+from .read_file import render_text_page
 
 
 def _results_dir(ctx: ToolContext):
@@ -29,19 +30,32 @@ def _results_list(ctx: ToolContext, args: dict) -> str:
 
 def _results_get(ctx: ToolContext, args: dict) -> str:
     rel = args["path"]
-    p = (ctx.workdir / rel).resolve()
+    root = ctx.workdir.resolve()
+    p = (root / rel).resolve()
     # Contain reads to the workdir.
-    if not str(p).startswith(str(ctx.workdir)):
+    try:
+        p.relative_to(root)
+    except ValueError:
         return f"[error] path escapes workdir: {rel}"
     if not p.is_file():
         return f"[error] not found: {rel}"
-    text = p.read_text(errors="replace")
+    raw_text = p.read_text(errors="replace")
+    text = raw_text
+    view = "text"
     if p.suffix == ".json":
         try:  # pretty + validate
             text = json.dumps(json.loads(text), ensure_ascii=False, indent=2)
+            view = "pretty_json"
         except json.JSONDecodeError:
             pass
-    return f"{rel}:\n{tail(text, max_lines=80, max_chars=6000)}"
+    return render_text_page(
+        p,
+        rel,
+        text,
+        start_line=args.get("start_line"),
+        end_line=args.get("end_line"),
+        view=view,
+    )
 
 
 results_list_tool = Tool(
@@ -53,11 +67,25 @@ results_list_tool = Tool(
 
 results_get_tool = Tool(
     name="results_get",
-    description="Read a file under the run workdir (e.g. a results/*.json).",
+    description=(
+        "Read a deterministic numbered page from a result file. JSON is "
+        "pretty-printed before pagination. The response includes total_lines "
+        "and next_start_line."
+    ),
     parameters={
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Workdir-relative path, e.g. results/fit.json"}
+            "path": {"type": "string", "description": "Workdir-relative path, e.g. results/fit.json"},
+            "start_line": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional 1-based first line for a targeted page.",
+            },
+            "end_line": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional inclusive last line for a targeted page.",
+            },
         },
         "required": ["path"],
     },

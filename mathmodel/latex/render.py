@@ -188,26 +188,47 @@ def render_report(
 ) -> str:
     """Render `templates/<template>/<template_file>` with `context` + results.
 
-    `context` keys used by the generic template: title, author, date, abstract,
-    keywords, cjk (bool), sections (list of {heading, body}).
+    `context` keys used by the templates: title, author, date, abstract,
+    keywords, cjk (bool), sections/appendices (lists of {heading, body}), and
+    references (a list of {key, text}).
     """
     template_dir = TEMPLATES_ROOT / template
     env = _env(template_dir)
 
     results = load_results(workdir)
-    full_ctx = {"results": results, "author": "", "date": r"\today", "abstract": "",
-                "keywords": "", "cjk": False, "sections": [], **context}
+    full_ctx = {
+        "results": results,
+        "author": "",
+        "date": r"\today",
+        "abstract": "",
+        "keywords": "",
+        "cjk": False,
+        "sections": [],
+        "appendices": [],
+        "references": [],
+        **context,
+    }
 
-    # First pass: resolve \VAR{...} embedded inside each section body.
-    rendered_sections = []
-    for s in full_ctx.get("sections", []):
-        body = env.from_string(s.get("body", "")).render(**full_ctx)
-        rendered_sections.append({
-            **s,
-            "heading": strip_manual_heading_number(s.get("heading", "")),
-            "body": normalize_latex_section_headings(body),
+    # First pass: resolve \VAR{...} embedded inside every model-authored region.
+    for region in ("sections", "appendices"):
+        rendered_blocks = []
+        for block in full_ctx.get(region, []):
+            body = env.from_string(block.get("body", "")).render(**full_ctx)
+            rendered_blocks.append({
+                **block,
+                "heading": strip_manual_heading_number(block.get("heading", "")),
+                "body": normalize_latex_section_headings(body),
+            })
+        full_ctx[region] = rendered_blocks
+
+    rendered_references = []
+    for reference in full_ctx.get("references", []):
+        rendered_references.append({
+            **reference,
+            "key": str(reference.get("key", "")).strip(),
+            "text": env.from_string(reference.get("text", "")).render(**full_ctx),
         })
-    full_ctx["sections"] = rendered_sections
+    full_ctx["references"] = rendered_references
     if full_ctx.get("abstract"):
         full_ctx["abstract"] = env.from_string(full_ctx["abstract"]).render(**full_ctx)
 

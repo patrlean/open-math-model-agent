@@ -1,0 +1,12 @@
+.git
+.env
+.provider-settings.json
+.runtime
+.venv
+benchmark-v1
+experiments
+tmp
+workspace
+**/__pycache__
+**/*.pyc
+mathmodel/dashboard/frontend/node_modules

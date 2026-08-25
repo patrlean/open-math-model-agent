@@ -87,6 +87,10 @@ class BackgroundSubagentManager:
         build_sub_registry: Callable[[], ToolRegistry],
         system_prompt: str,
         compact_threshold_tokens: int,
+        keep_tail_messages: int,
+        compaction_strategy: str,
+        tool_result_externalize_threshold_tokens: int,
+        tool_result_preview_chars: int,
         max_steps: int,
         on_event: Callable[[str, dict], None] | None,
     ) -> None:
@@ -94,6 +98,12 @@ class BackgroundSubagentManager:
         self.build_sub_registry = build_sub_registry
         self.system_prompt = system_prompt
         self.compact_threshold_tokens = compact_threshold_tokens
+        self.keep_tail_messages = keep_tail_messages
+        self.compaction_strategy = compaction_strategy
+        self.tool_result_externalize_threshold_tokens = (
+            tool_result_externalize_threshold_tokens
+        )
+        self.tool_result_preview_chars = tool_result_preview_chars
         self.max_steps = max_steps
         self.on_event = on_event
         self._condition = threading.Condition()
@@ -138,6 +148,12 @@ class BackgroundSubagentManager:
                     ctx=sub_ctx,
                     system_prompt=self.system_prompt,
                     compact_threshold_tokens=self.compact_threshold_tokens,
+                    keep_tail_messages=self.keep_tail_messages,
+                    compaction_strategy=self.compaction_strategy,
+                    tool_result_externalize_threshold_tokens=(
+                        self.tool_result_externalize_threshold_tokens
+                    ),
+                    tool_result_preview_chars=self.tool_result_preview_chars,
                     max_steps=self.max_steps,
                     on_event=sub_on_event,
                     agent_role=f"Subagent {n}",
@@ -289,6 +305,10 @@ def make_background_subagent_tools(
     build_sub_registry: Callable[[], ToolRegistry],
     system_prompt: str,
     compact_threshold_tokens: int = 1_000_000,
+    keep_tail_messages: int = 12,
+    compaction_strategy: str = "legacy_monolithic",
+    tool_result_externalize_threshold_tokens: int = 1_000,
+    tool_result_preview_chars: int = 600,
     max_steps: int = 30,
     on_event: Callable[[str, dict], None] | None = None,
 ) -> tuple[Tool, Tool, BackgroundSubagentManager]:
@@ -298,6 +318,10 @@ def make_background_subagent_tools(
         build_sub_registry,
         system_prompt,
         compact_threshold_tokens,
+        keep_tail_messages,
+        compaction_strategy,
+        tool_result_externalize_threshold_tokens,
+        tool_result_preview_chars,
         max_steps,
         on_event,
     )
@@ -330,6 +354,10 @@ def make_spawn_subagent_tool(
     build_sub_registry: Callable[[], ToolRegistry],
     system_prompt: str,
     compact_threshold_tokens: int = 1_000_000,
+    keep_tail_messages: int = 12,
+    compaction_strategy: str = "legacy_monolithic",
+    tool_result_externalize_threshold_tokens: int = 1_000,
+    tool_result_preview_chars: int = 600,
     max_steps: int = 30,
     on_event: Callable[[str, dict], None] | None = None,
 ) -> Tool:
@@ -364,6 +392,12 @@ def make_spawn_subagent_tool(
             ctx=sub_ctx,
             system_prompt=system_prompt,
             compact_threshold_tokens=compact_threshold_tokens,
+            keep_tail_messages=keep_tail_messages,
+            compaction_strategy=compaction_strategy,
+            tool_result_externalize_threshold_tokens=(
+                tool_result_externalize_threshold_tokens
+            ),
+            tool_result_preview_chars=tool_result_preview_chars,
             max_steps=max_steps,
             on_event=sub_on_event,
         )

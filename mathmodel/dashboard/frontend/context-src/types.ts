@@ -83,3 +83,47 @@ export interface ContextRequestDetail extends ContextRequestSummary {
   items: ContextItem[]
   raw_request: Record<string, unknown>
 }
+
+export type ToolMetricAgent = 'all' | 'main' | 'verifier' | 'subagent'
+
+export interface ToolMetricCounters {
+  total_calls: number
+  completed_calls: number
+  pending_calls: number
+  interrupted_calls: number
+  protocol_evaluated: number
+  protocol_successes: number
+  objective_evaluated: number
+  objective_successes: number
+  failed_calls: number
+  timed_out_calls: number
+  cancelled_calls: number
+  compile_attempts: number
+  compile_successes: number
+  acceptance_attempts: number
+  acceptance_successes: number
+  verdict_attempts: number
+  verdict_successes: number
+  retry_attempts: number
+  recovered_retries: number
+}
+
+export interface ToolMetricRow extends ToolMetricCounters {
+  name: string
+}
+
+export interface ToolMetricGroup {
+  summary: ToolMetricCounters
+  tools: ToolMetricRow[]
+}
+
+export interface ToolMetrics {
+  run_status: RunStatus
+  groups: Record<ToolMetricAgent, ToolMetricGroup>
+  definitions: {
+    completed: string
+    protocol: string
+    objective: string
+    retry: string
+  }
+}

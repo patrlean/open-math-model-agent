@@ -17,10 +17,11 @@ from ..config import PROJECT_ROOT
 from ..contextlog import (
     CONTEXT_LOG_FILENAME,
     context_log_stats,
-    read_context_requests,
+    read_context_request,
+    read_context_request_summaries,
     request_detail,
-    request_summary,
 )
+from ..tool_metrics import conversation_tool_metrics
 
 WORKSPACE = PROJECT_ROOT / "workspace"
 STATIC_DIR = Path(__file__).resolve().parent.parent / "dashboard" / "static"
@@ -76,23 +77,34 @@ def list_context_runs() -> list[dict]:
 
 def list_run_requests(run_id: str) -> list[dict]:
     directory = _safe_run_dir(run_id)
-    records = read_context_requests(directory / CONTEXT_LOG_FILENAME)
-    return [request_summary(record) for record in reversed(records)]
+    summaries = read_context_request_summaries(
+        directory / CONTEXT_LOG_FILENAME
+    )
+    return list(reversed(summaries))
 
 
 def get_request(run_id: str, request_id: str) -> dict:
     directory = _safe_run_dir(run_id)
-    records = read_context_requests(directory / CONTEXT_LOG_FILENAME)
-    record = next(
-        (
-            item for item in records
-            if str(item.get("request_id")) == request_id
-        ),
-        None,
+    record = read_context_request(
+        directory / CONTEXT_LOG_FILENAME,
+        request_id,
     )
     if record is None:
         raise FileNotFoundError("request not found")
     return request_detail(record)
+
+
+def get_tool_metrics(run_id: str) -> dict:
+    directory = _safe_run_dir(run_id)
+    meta = _read_json(directory / "meta.json")
+    return conversation_tool_metrics(
+        directory / "events.jsonl",
+        run_status=str(meta.get("status") or "unknown"),
+    )
+
+
+class ClientDisconnected(Exception):
+    """Stop work quietly after the browser cancels a local request."""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -115,7 +127,10 @@ class Handler(BaseHTTPRequestHandler):
         for key, value in (extra_headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            raise ClientDisconnected from exc
 
     def _json(self, value, code: int = 200) -> None:
         self._send(
@@ -169,6 +184,10 @@ class Handler(BaseHTTPRequestHandler):
                     query.get("run_id", [""])[0],
                     query.get("request_id", [""])[0],
                 ))
+            elif parsed.path == "/api/tool-metrics":
+                self._json(get_tool_metrics(
+                    query.get("run_id", [""])[0],
+                ))
             elif parsed.path == "/api/export":
                 detail = get_request(
                     query.get("run_id", [""])[0],
@@ -198,6 +217,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": str(exc)}, 404)
         except ValueError as exc:
             self._json({"error": str(exc)}, 400)
+        except ClientDisconnected:
+            pass
         except Exception as exc:
             self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
 

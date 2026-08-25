@@ -47,6 +47,14 @@ class ThinkingToolProvider(Provider):
         return ChatResponse(text="Finished.")
 
 
+class FinalProvider(Provider):
+    def __init__(self) -> None:
+        super().__init__("final-test")
+
+    def chat(self, messages, tools=None, **kwargs):
+        return ChatResponse(text="Finished.")
+
+
 def check_thinking_progress_is_emitted_separately() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         workdir = Path(tmp)
@@ -100,6 +108,31 @@ def check_late_provider_response_is_discarded() -> None:
         )
 
 
+def check_internal_continuation_is_not_user_visible() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        workdir = Path(tmp)
+        events: list[tuple[str, dict]] = []
+        state_path = workdir / "session_state.json"
+        agent = Agent(
+            FinalProvider(),
+            ToolRegistry(),
+            ToolContext(workdir, LocalSandbox(workdir)),
+            "system",
+            max_steps=1,
+            on_event=lambda kind, data: events.append((kind, data)),
+            state_path=state_path,
+        )
+        instruction = "[Orchestrator continuation — this is not user input]"
+        assert agent.run(instruction, internal_instruction=True) == "Finished."
+        assert not any(kind == "task" for kind, _ in events)
+        persisted = json.loads(state_path.read_text())
+        matching = [
+            message for message in persisted["messages"]
+            if message.get("content") == instruction
+        ]
+        assert matching == [{"role": "system", "content": instruction}]
+
+
 def check_stop_is_immediately_continuable() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         workspace = Path(tmp)
@@ -150,10 +183,72 @@ def check_stop_is_immediately_continuable() -> None:
             server.WORKSPACE = original_workspace
 
 
+def check_max_steps_direct_continue_adds_exactly_40_steps() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = Path(tmp)
+        run_id = "max-steps-resume"
+        workdir = workspace / run_id
+        workdir.mkdir()
+        (workdir / "meta.json").write_text(json.dumps({
+            "name": "max steps resume",
+            "task": "original task",
+            "created": time.time(),
+            "status": "stopped",
+            "stop_reason": "max_steps",
+            "mode": "modeling",
+            "main_agent_max_steps": 200,
+        }))
+        (workdir / "events.jsonl").write_text(
+            json.dumps({"kind": "max_steps", "subagent": 3}) + "\n"
+            + json.dumps({"kind": "max_steps", "step": 200}) + "\n"
+        )
+        (workdir / "session_state.json").write_text(json.dumps({
+            "messages": [
+                {"role": "system", "content": "system"},
+                {"role": "system", "content": "memory"},
+            ],
+            "run_counter": {},
+            "total_usage": {},
+            "context_tokens": 0,
+        }))
+
+        original_workspace = server.WORKSPACE
+        original_start = server._start_agent_thread
+        captured: dict = {}
+        server.WORKSPACE = workspace
+
+        def fake_start(rid, directory, task, saved, **kwargs):
+            captured.update({
+                "id": rid,
+                "task": task,
+                "saved": saved,
+                **kwargs,
+            })
+            server._set_status(directory, "running")
+
+        try:
+            server._start_agent_thread = fake_start
+            result = server.continue_after_max_steps(run_id)
+            assert result["added_steps"] == 40
+            assert result["agent_settings"]["max_steps"] == 240
+            assert captured["id"] == run_id
+            assert captured["resume"] is True
+            assert captured["max_steps_override"] == 40
+            assert captured["internal_instruction"] is True
+            assert "not user input" in captured["task"]
+            assert json.loads((workdir / "meta.json").read_text())["main_agent_max_steps"] == 240
+            assert server._run_status(workdir) == "running"
+        finally:
+            server._start_agent_thread = original_start
+            server.WORKSPACE = original_workspace
+
+
 def main() -> None:
     check_thinking_progress_is_emitted_separately()
     check_late_provider_response_is_discarded()
+    check_internal_continuation_is_not_user_visible()
     check_stop_is_immediately_continuable()
+    check_max_steps_direct_continue_adds_exactly_40_steps()
     print("dashboard interrupt/resume checks: passed")
 
 

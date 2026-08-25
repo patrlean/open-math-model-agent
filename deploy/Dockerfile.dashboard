@@ -1,0 +1,18 @@
+FROM python:3.11-slim
+
+ARG TECTONIC_VERSION=0.16.9
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl docker-cli tini \
+    && curl -fsSL "https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%40${TECTONIC_VERSION}/tectonic-${TECTONIC_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+      | tar -xz -C /usr/local/bin tectonic \
+    && chmod 0755 /usr/local/bin/tectonic \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/open-math-model-agent
+
+COPY requirements.txt /tmp/mathmodel-requirements.txt
+RUN pip install --no-cache-dir -r /tmp/mathmodel-requirements.txt
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python", "-m", "mathmodel.dashboard.server", "--port", "8765"]

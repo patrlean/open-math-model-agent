@@ -12,6 +12,7 @@ import {
   fetchRequestDetail,
   fetchRequests,
   fetchRuns,
+  fetchToolMetrics,
 } from './api'
 import {
   categoryMeta,
@@ -28,7 +29,12 @@ import type {
   ContextRequestDetail,
   ContextRequestSummary,
   ContextRun,
+  ToolMetricAgent,
+  ToolMetricCounters,
+  ToolMetrics,
 } from './types'
+import { LanguageSwitcher, useLanguage } from '../src/i18n'
+import loadingRingUrl from '../src/assets/sequential-loading-ring.svg'
 
 function InspectorMark() {
   return (
@@ -64,24 +70,350 @@ function DownloadIcon() {
   )
 }
 
+interface ToolCallCount {
+  count: number
+  name: string
+}
+
+function getToolCallCounts(items: ContextItem[]): ToolCallCount[] {
+  const counts = new Map<string, number>()
+  for (const item of items) {
+    if (item.category !== 'tool_call') continue
+    const content = item.content
+    const rawName = (
+      content
+      && typeof content === 'object'
+      && !Array.isArray(content)
+    ) ? (content as { name?: unknown }).name : null
+    const name = typeof rawName === 'string' && rawName.trim()
+      ? rawName.trim()
+      : 'unknown'
+    counts.set(name, (counts.get(name) || 0) + 1)
+  }
+  return Array.from(counts, ([name, count]) => ({ count, name }))
+    .sort((left, right) => (
+      right.count - left.count || left.name.localeCompare(right.name)
+    ))
+}
+
+const ToolCallStats = memo(function ToolCallStats({
+  items,
+}: {
+  items: ContextItem[]
+}) {
+  const { language } = useLanguage()
+  const en = language === 'en'
+  const tools = useMemo(() => getToolCallCounts(items), [items])
+  const total = useMemo(
+    () => tools.reduce((sum, tool) => sum + tool.count, 0),
+    [tools],
+  )
+
+  return (
+    <details className="tool-call-stats">
+      <summary title={en ? 'View tool call counts in this context' : '查看当前 Context 中的工具调用次数'}>
+        <span>{en ? 'Tool calls' : '工具调用'}</span>
+        <strong>{total}</strong>
+        <i aria-hidden="true">⌄</i>
+      </summary>
+      <div className="tool-call-stats-menu">
+        <header>
+          <div>
+            <strong>{en ? 'Tool calls in this context' : '当前 Context 的工具调用'}</strong>
+            <small>{en ? `${tools.length} tools · ${total} calls` : `${tools.length} 个工具 · ${total} 次调用`}</small>
+          </div>
+        </header>
+        {tools.length ? (
+          <ol>
+            {tools.map((tool) => (
+              <li key={tool.name}>
+                <code>{tool.name}</code>
+                <strong>{tool.count}</strong>
+              </li>
+            ))}
+          </ol>
+        ) : (
+          <p>{en ? 'No tool has been called yet.' : '当前还没有工具调用。'}</p>
+        )}
+      </div>
+    </details>
+  )
+})
+
+function metricRate(successes: number, evaluated: number) {
+  if (!evaluated) return '—'
+  return `${Math.round((successes / evaluated) * 100)}%`
+}
+
+function metricFraction(successes: number, evaluated: number) {
+  return evaluated ? `${successes}/${evaluated}` : '—'
+}
+
+const ToolMetricCard = memo(function ToolMetricCard({
+  label,
+  value,
+  detail,
+  tone = '',
+}: {
+  label: string
+  value: string
+  detail: string
+  tone?: string
+}) {
+  return (
+    <div className={`tool-metric-card ${tone}`}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+      <small>{detail}</small>
+    </div>
+  )
+})
+
+function specializedMetrics(summary: ToolMetricCounters, en: boolean) {
+  return [
+    summary.compile_attempts ? {
+      key: 'compile',
+      label: en ? 'LaTeX compiled' : 'LaTeX 编译',
+      successes: summary.compile_successes,
+      attempts: summary.compile_attempts,
+    } : null,
+    summary.acceptance_attempts ? {
+      key: 'acceptance',
+      label: en ? 'Paper accepted' : '论文验收',
+      successes: summary.acceptance_successes,
+      attempts: summary.acceptance_attempts,
+    } : null,
+    summary.verdict_attempts ? {
+      key: 'verdict',
+      label: en ? 'Valid verdicts' : '有效验证结论',
+      successes: summary.verdict_successes,
+      attempts: summary.verdict_attempts,
+    } : null,
+    summary.retry_attempts ? {
+      key: 'recovery',
+      label: en ? 'Retry recovery' : '重试恢复',
+      successes: summary.recovered_retries,
+      attempts: summary.retry_attempts,
+    } : null,
+  ].filter((item): item is {
+    key: string
+    label: string
+    successes: number
+    attempts: number
+  } => item !== null)
+}
+
+const ToolMetricsPanel = memo(function ToolMetricsPanel({
+  runId,
+  runName,
+}: {
+  runId: string
+  runName: string
+}) {
+  const { language } = useLanguage()
+  const en = language === 'en'
+  const [metrics, setMetrics] = useState<ToolMetrics | null>(null)
+  const [agent, setAgent] = useState<ToolMetricAgent>('all')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      setMetrics(await fetchToolMetrics(runId))
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setLoading(false)
+    }
+  }, [runId])
+
+  const group = metrics?.groups[agent]
+  const summary = group?.summary
+  const agentLabels: Record<ToolMetricAgent, string> = en
+    ? {
+      all: 'All agents',
+      main: 'Main Agent',
+      verifier: 'Verifier',
+      subagent: 'Sub-agent',
+    }
+    : {
+      all: '全部 Agent',
+      main: '主 Agent',
+      verifier: '验证 Agent',
+      subagent: 'Sub-agent',
+    }
+
+  return (
+    <details
+      className="tool-metrics"
+      onToggle={(event) => {
+        if (event.currentTarget.open && !metrics && !loading) void load()
+      }}
+    >
+      <summary title={en ? 'View conversation-level tool reliability' : '查看会话级工具可靠性'}>
+        <span>{en ? 'Tool metrics' : '工具指标'}</span>
+        <i aria-hidden="true">⌄</i>
+      </summary>
+      <section className="tool-metrics-panel">
+        <header>
+          <div>
+            <strong>{en ? 'Tool reliability' : '工具可靠性'}</strong>
+            <small title={runName}>{runName}</small>
+          </div>
+          <div className="tool-metrics-controls">
+            <select
+              aria-label={en ? 'Filter tool metrics by agent type' : '按 Agent 类型筛选工具指标'}
+              onChange={(event) => setAgent(event.target.value as ToolMetricAgent)}
+              value={agent}
+            >
+              {(Object.keys(agentLabels) as ToolMetricAgent[]).map((key) => (
+                key === 'all' || (metrics?.groups[key].summary.total_calls || 0) > 0
+                  ? <option key={key} value={key}>{agentLabels[key]}</option>
+                  : null
+              ))}
+            </select>
+            <button disabled={loading} onClick={() => void load()} type="button">
+              {loading ? '…' : (en ? 'Refresh' : '刷新')}
+            </button>
+          </div>
+        </header>
+
+        {error ? <p className="tool-metrics-error">{error}</p> : null}
+        {!metrics && loading ? (
+          <LoadingState label={en ? 'Calculating unique tool calls…' : '正在统计唯一工具调用…'} />
+        ) : summary && group ? (
+          <>
+            <div className="tool-metric-cards">
+              <ToolMetricCard
+                detail={en ? `${summary.completed_calls}/${summary.total_calls} calls returned` : `${summary.completed_calls}/${summary.total_calls} 次调用已返回`}
+                label={en ? 'Completion' : '返回完成率'}
+                value={metricRate(summary.completed_calls, summary.total_calls)}
+              />
+              <ToolMetricCard
+                detail={en ? `${summary.protocol_successes}/${summary.protocol_evaluated} valid contracts` : `${summary.protocol_successes}/${summary.protocol_evaluated} 次协议有效`}
+                label={en ? 'Valid invocation' : '调用有效率'}
+                tone="protocol"
+                value={metricRate(summary.protocol_successes, summary.protocol_evaluated)}
+              />
+              <ToolMetricCard
+                detail={en ? `${summary.objective_successes}/${summary.objective_evaluated} objectives met` : `${summary.objective_successes}/${summary.objective_evaluated} 次达到工具目标`}
+                label={en ? 'Objective success' : '目标成功率'}
+                tone="objective"
+                value={metricRate(summary.objective_successes, summary.objective_evaluated)}
+              />
+              <ToolMetricCard
+                detail={en ? `${summary.timed_out_calls} timed out · ${summary.interrupted_calls} interrupted` : `${summary.timed_out_calls} 次超时 · ${summary.interrupted_calls} 次中断`}
+                label={en ? 'Failed outcomes' : '目标失败'}
+                tone={summary.failed_calls ? 'failure' : ''}
+                value={String(summary.failed_calls)}
+              />
+            </div>
+
+            {specializedMetrics(summary, en).length ? (
+              <div className="specialized-metrics">
+                {specializedMetrics(summary, en).map((item) => (
+                  <div key={item.key}>
+                    <span>{item.label}</span>
+                    <strong>{metricRate(item.successes, item.attempts)}</strong>
+                    <small>{metricFraction(item.successes, item.attempts)}</small>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+
+            {group.tools.length ? (
+              <div className="tool-metrics-table-wrap">
+                <table className="tool-metrics-table">
+                  <thead>
+                    <tr>
+                      <th>{en ? 'Tool' : '工具'}</th>
+                      <th>{en ? 'Calls' : '调用'}</th>
+                      <th>{en ? 'Returned' : '返回'}</th>
+                      <th>{en ? 'Valid' : '有效'}</th>
+                      <th>{en ? 'Objective' : '目标成功'}</th>
+                      <th>{en ? 'Timeout' : '超时'}</th>
+                      <th>{en ? 'Retry' : '重试'}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {group.tools.map((tool) => (
+                      <tr key={tool.name}>
+                        <td><code>{tool.name}</code></td>
+                        <td>{tool.total_calls}</td>
+                        <td>{metricRate(tool.completed_calls, tool.total_calls)}</td>
+                        <td>{metricRate(tool.protocol_successes, tool.protocol_evaluated)}</td>
+                        <td>{metricRate(tool.objective_successes, tool.objective_evaluated)}</td>
+                        <td>{tool.timed_out_calls}</td>
+                        <td>{tool.retry_attempts}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <p className="tool-metrics-empty">{en ? 'No tool calls for this Agent type.' : '这个 Agent 类型还没有工具调用。'}</p>
+            )}
+
+            <footer>
+              {en
+                ? 'Returned means a durable tool_result exists. Valid excludes malformed arguments and contract errors. Objective applies tool-specific checks: run_code must exit 0; write_paper/edit_paragraph must compile; verification submission must record a verdict. User interruption is not counted as an objective failure.'
+                : '“已返回”表示存在持久化 tool_result；“有效”排除参数和协议错误；“目标成功”使用工具专属判定：run_code 必须 exit 0，write_paper/edit_paragraph 必须成功编译，验证提交必须记录有效 verdict。用户中断不计入目标失败。'}
+            </footer>
+          </>
+        ) : null}
+      </section>
+    </details>
+  )
+})
+
+function LoadingState({
+  className = '',
+  label,
+}: {
+  className?: string
+  label: string
+}) {
+  return (
+    <div
+      aria-live="polite"
+      className={`loading-state ${className}`}
+      role="status"
+    >
+      <img aria-hidden="true" className="context-loading-ring" src={loadingRingUrl} />
+      <span>{label}</span>
+    </div>
+  )
+}
+
 const RunSidebar = memo(function RunSidebar({
+  loading,
   runs,
   selectedId,
   onSelect,
 }: {
+  loading: boolean
   runs: ContextRun[]
   selectedId: string | null
   onSelect: (id: string) => void
 }) {
+  const { language } = useLanguage()
+  const en = language === 'en'
   return (
-    <aside className="run-sidebar" aria-label="建模会话">
+    <aside className="run-sidebar" aria-label={en ? 'Modeling conversations' : '建模会话'}>
       <header className="rail-heading">
-        <strong>建模会话 / 运行</strong>
-        <span>{runs.length}</span>
+        <strong>{en ? 'CONVERSATIONS / RUNS' : '建模会话 / 运行'}</strong>
+        <span>{loading ? (en ? 'Loading…' : '加载中…') : runs.length}</span>
       </header>
       <div className="run-scroll">
-        {runs.length === 0 ? (
-          <div className="rail-empty">还没有会话记录。</div>
+        {loading ? (
+          <LoadingState
+            className="run-loading"
+            label={en ? 'Loading conversations…' : '正在加载会话…'}
+          />
+        ) : runs.length === 0 ? (
+          <div className="rail-empty">{en ? 'No conversations yet.' : '还没有会话记录。'}</div>
         ) : runs.map((run) => (
           <button
             className={run.id === selectedId ? 'run-entry selected' : 'run-entry'}
@@ -92,19 +424,19 @@ const RunSidebar = memo(function RunSidebar({
             <span className="run-name">{run.name}</span>
             <span className="run-status-line">
               <i className={`status-dot ${run.status}`} />
-              {statusLabel(run.status)}
-              <time>{formatClock(run.latest_request_ts || run.created)}</time>
+              {statusLabel(run.status, language)}
+              <time>{formatClock(run.latest_request_ts || run.created, language)}</time>
             </span>
             <span className="run-meta">
-              <span>{run.request_count} 次请求</span>
-              <span>{run.latest_model || '尚无模型请求'}</span>
+              <span>{en ? `${run.request_count} requests` : `${run.request_count} 次请求`}</span>
+              <span>{run.latest_model || (en ? 'No model requests yet' : '尚无模型请求')}</span>
             </span>
           </button>
         ))}
       </div>
       <footer className="local-note">
         <span className="privacy-dot" />
-        仅保存在本机 workspace
+        {en ? 'Stored only in the local workspace' : '仅保存在本机 workspace'}
       </footer>
     </aside>
   )
@@ -119,30 +451,126 @@ function roleTone(role: string) {
   return 'main'
 }
 
+type AgentFilter = 'all' | 'main' | 'verifier' | 'subagent' | 'other'
+
+function agentFilterForRole(role: string): Exclude<AgentFilter, 'all'> {
+  const lowered = role.toLowerCase()
+  if (lowered.includes('verifier') || lowered.includes('verification')) {
+    return 'verifier'
+  }
+  if (lowered.includes('subagent') || lowered.includes('sub-agent')) {
+    return 'subagent'
+  }
+  if (lowered.includes('main agent')) return 'main'
+  return 'other'
+}
+
 const RequestTimeline = memo(function RequestTimeline({
+  loading,
   requests,
   selectedId,
   onSelect,
 }: {
+  loading: boolean
   requests: ContextRequestSummary[]
   selectedId: string | null
   onSelect: (id: string) => void
 }) {
+  const { language } = useLanguage()
+  const en = language === 'en'
+  const [agentFilter, setAgentFilter] = useState<AgentFilter>('all')
+  const agentCounts = useMemo(() => {
+    const counts: Record<Exclude<AgentFilter, 'all'>, number> = {
+      main: 0,
+      verifier: 0,
+      subagent: 0,
+      other: 0,
+    }
+    for (const request of requests) {
+      counts[agentFilterForRole(request.agent_role)] += 1
+    }
+    return counts
+  }, [requests])
+  const filteredRequests = useMemo(
+    () => agentFilter === 'all'
+      ? requests
+      : requests.filter(
+        (request) => agentFilterForRole(request.agent_role) === agentFilter,
+      ),
+    [agentFilter, requests],
+  )
+  const changeAgentFilter = useCallback((value: AgentFilter) => {
+    setAgentFilter(value)
+    const nextRequests = value === 'all'
+      ? requests
+      : requests.filter(
+        (request) => agentFilterForRole(request.agent_role) === value,
+      )
+    if (
+      nextRequests.length
+      && !nextRequests.some((request) => request.request_id === selectedId)
+    ) {
+      onSelect(nextRequests[0].request_id)
+    }
+  }, [onSelect, requests, selectedId])
+  const filterLabels: Record<AgentFilter, string> = en
+    ? {
+      all: 'All agents',
+      main: 'Main Agent',
+      verifier: 'Verifier',
+      subagent: 'Sub-agent',
+      other: 'Other agents',
+    }
+    : {
+      all: '全部 Agent',
+      main: '主 Agent',
+      verifier: '验证 Agent',
+      subagent: 'Sub-agent',
+      other: '其他 Agent',
+    }
   return (
-    <aside className="request-rail" aria-label="模型请求时间线">
+    <aside className="request-rail" aria-label={en ? 'Model request timeline' : '模型请求时间线'}>
       <header className="rail-heading request-heading">
-        <strong>请求时间线</strong>
-        <span>{requests.length} 个请求</span>
+        <strong>{en ? 'REQUEST TIMELINE' : '请求时间线'}</strong>
+        <div className="request-heading-controls">
+          <select
+            aria-label={en ? 'Filter requests by agent type' : '按 Agent 类型筛选请求'}
+            onChange={(event) => changeAgentFilter(event.target.value as AgentFilter)}
+            value={agentFilter}
+          >
+            <option value="all">{filterLabels.all}</option>
+            {agentCounts.main ? <option value="main">{filterLabels.main}</option> : null}
+            {agentCounts.verifier ? <option value="verifier">{filterLabels.verifier}</option> : null}
+            {agentCounts.subagent ? <option value="subagent">{filterLabels.subagent}</option> : null}
+            {agentCounts.other ? <option value="other">{filterLabels.other}</option> : null}
+          </select>
+          <span>{loading
+            ? (en ? 'Loading…' : '加载中…')
+            : agentFilter === 'all'
+              ? requests.length
+              : `${filteredRequests.length}/${requests.length}`}</span>
+        </div>
       </header>
       <div className="request-columns" aria-hidden="true">
-        <span>#</span><span>Agent</span><span>模型</span><span>Tokens</span>
+        <span>#</span><span>Agent</span><span>{en ? 'Model' : '模型'}</span><span>Tokens</span>
       </div>
       <div className="request-scroll">
-        {requests.length === 0 ? (
+        {loading ? (
+          <LoadingState
+            className="request-loading"
+            label={en ? 'Loading request timeline…' : '正在加载请求时间线…'}
+          />
+        ) : requests.length === 0 ? (
           <div className="rail-empty request-empty">
-            这个会话还没有发送新的模型请求。记录功能只捕获启用后的请求。
+            {en
+              ? 'This conversation has not sent any model requests. Logging only captures requests made after it was enabled.'
+              : '这个会话还没有发送新的模型请求。记录功能只捕获启用后的请求。'}
           </div>
-        ) : requests.map((request) => {
+        ) : filteredRequests.length === 0 ? (
+          <div className="rail-empty request-empty">
+            {en ? 'No requests match this agent type.' : '没有符合当前 Agent 类型的请求。'}
+          </div>
+        ) : filteredRequests.map((request) => {
           const actualTokens = request.usage.prompt_tokens
           return (
             <button
@@ -179,7 +607,8 @@ function CategoryFilter({
   category: ContextCategory
   onToggle: (category: ContextCategory) => void
 }) {
-  const meta = categoryMeta[category]
+  const { language } = useLanguage()
+  const meta = categoryMeta[language][category]
   return (
     <button
       aria-pressed={active}
@@ -203,6 +632,8 @@ const ContextRow = memo(function ContextRow({
   open: boolean
   onToggle: () => void
 }) {
+  const { language } = useLanguage()
+  const en = language === 'en'
   const [copied, setCopied] = useState(false)
   const rendered = stringifyContent(item.content)
   const structured = typeof item.content !== 'string'
@@ -221,7 +652,7 @@ const ContextRow = memo(function ContextRow({
         type="button"
       >
         <span className="row-number">{index + 1}</span>
-        <span className="category-tag">{categoryMeta[item.category].short}</span>
+        <span className="category-tag">{categoryMeta[language][item.category].short}</span>
         <span className="row-title">
           <strong>{item.label}</strong>
           {item.source ? <small>{item.source}</small> : null}
@@ -230,10 +661,10 @@ const ContextRow = memo(function ContextRow({
         <Chevron open={open} />
       </button>
       <div className={open ? 'row-content open' : 'row-content'}>
-        <pre className={structured ? 'structured' : ''}>{rendered || '（空内容）'}</pre>
-        <button className="copy-button" onClick={copy} title="复制这段 Context" type="button">
+        <pre className={structured ? 'structured' : ''}>{rendered || (en ? '(empty)' : '（空内容）')}</pre>
+        <button className="copy-button" onClick={copy} title={en ? 'Copy this context block' : '复制这段 Context'} type="button">
           <CopyIcon />
-          <span>{copied ? '已复制' : '复制'}</span>
+          <span>{copied ? (en ? 'Copied' : '已复制') : (en ? 'Copy' : '复制')}</span>
         </button>
       </div>
     </article>
@@ -241,28 +672,46 @@ const ContextRow = memo(function ContextRow({
 })
 
 function EmptyDetail() {
+  const { language } = useLanguage()
+  const en = language === 'en'
   return (
     <main className="detail-empty">
       <InspectorMark />
-      <h2>等待第一条 Context 记录</h2>
-      <p>在数学建模页面发送消息后，这里会显示实际提交给模型 API 的完整上下文。</p>
+      <h2>{en ? 'Waiting for the first context record' : '等待第一条 Context 记录'}</h2>
+      <p>{en
+        ? 'After a message is sent from the modeling workspace, the complete context submitted to the model API will appear here.'
+        : '在数学建模页面发送消息后，这里会显示实际提交给模型 API 的完整上下文。'}</p>
+    </main>
+  )
+}
+
+function DetailLoading({ label }: { label: string }) {
+  return (
+    <main className="detail-loading">
+      <LoadingState className="context-loading" label={label} />
     </main>
   )
 }
 
 function RequestDetail({
   detail,
+  runId,
+  runName,
   categories,
   search,
   raw,
   onRawChange,
 }: {
   detail: ContextRequestDetail
+  runId: string
+  runName: string
   categories: Set<ContextCategory>
   search: string
   raw: boolean
   onRawChange: (value: boolean) => void
 }) {
+  const { language } = useLanguage()
+  const en = language === 'en'
   const deferredSearch = useDeferredValue(search.trim().toLowerCase())
   const [expanded, setExpanded] = useState<Set<number>>(() => new Set([0]))
   const filteredItems = useMemo(() => detail.items.filter((item) => {
@@ -287,29 +736,31 @@ function RequestDetail({
     <main className="detail-canvas">
       <header className="request-header">
         <div>
-          <span className="request-kicker">请求 #{detail.sequence}</span>
+          <span className="request-kicker">{en ? `Request #${detail.sequence}` : `请求 #${detail.sequence}`}</span>
           <h1>{detail.agent_role}</h1>
           <p>
             {detail.phase}
-            {detail.step ? ` · 第 ${detail.step} 步` : ''}
+            {detail.step ? (en ? ` · Step ${detail.step}` : ` · 第 ${detail.step} 步`) : ''}
             {' · '}
-            {formatDate(detail.ts)}
+            {formatDate(detail.ts, language)}
           </p>
         </div>
         <dl className="request-facts">
-          <div><dt>模型</dt><dd>{detail.model}</dd></div>
-          <div><dt>输入 Tokens</dt><dd>{isEstimated ? '≈ ' : ''}{formatTokens(inputTokens)}</dd></div>
-          <div><dt>输出 Tokens</dt><dd>{formatTokens(usage.completion_tokens)}</dd></div>
-          <div><dt>耗时</dt><dd>{detail.duration_seconds ? `${detail.duration_seconds.toFixed(2)}s` : '进行中'}</dd></div>
+          <div><dt>{en ? 'Model' : '模型'}</dt><dd>{detail.model}</dd></div>
+          <div><dt>{en ? 'Input tokens' : '输入 Tokens'}</dt><dd>{isEstimated ? '≈ ' : ''}{formatTokens(inputTokens)}</dd></div>
+          <div><dt>{en ? 'Output tokens' : '输出 Tokens'}</dt><dd>{formatTokens(usage.completion_tokens)}</dd></div>
+          <div><dt>{en ? 'Duration' : '耗时'}</dt><dd>{detail.duration_seconds ? `${detail.duration_seconds.toFixed(2)}s` : (en ? 'In progress' : '进行中')}</dd></div>
         </dl>
         <div className="header-actions">
+          <ToolMetricsPanel key={runId} runId={runId} runName={runName} />
+          <ToolCallStats items={detail.items} />
           <button
             aria-pressed={raw}
             className={raw ? 'raw-button active' : 'raw-button'}
             onClick={() => onRawChange(!raw)}
             type="button"
           >
-            {'{ }'} 原始 JSON
+            {'{ }'} {en ? 'Raw JSON' : '原始 JSON'}
           </button>
         </div>
       </header>
@@ -318,7 +769,7 @@ function RequestDetail({
         <div className="request-error">{detail.error}</div>
       ) : null}
 
-      <section className="context-scroll" aria-label="请求 Context 内容">
+      <section className="context-scroll" aria-label={en ? 'Request context content' : '请求 Context 内容'}>
         {raw ? (
           <article className="raw-json">
             <pre>{JSON.stringify(detail.raw_request, null, 2)}</pre>
@@ -342,14 +793,14 @@ function RequestDetail({
             )
           })
         ) : (
-          <div className="filter-empty">当前筛选条件下没有 Context 内容。</div>
+          <div className="filter-empty">{en ? 'No context matches the current filters.' : '当前筛选条件下没有 Context 内容。'}</div>
         )}
       </section>
       <footer className="request-footer">
-        <span>输入 {formatTokens(usage.prompt_tokens || detail.estimated_input_tokens)}{isEstimated ? '（估算）' : ''}</span>
-        <span>输出 {formatTokens(usage.completion_tokens)}</span>
-        <span>消息 {detail.message_count}</span>
-        <span>工具定义 {detail.tool_definition_count}</span>
+        <span>{en ? 'Input' : '输入'} {formatTokens(usage.prompt_tokens || detail.estimated_input_tokens)}{isEstimated ? (en ? ' (estimated)' : '（估算）') : ''}</span>
+        <span>{en ? 'Output' : '输出'} {formatTokens(usage.completion_tokens)}</span>
+        <span>{en ? 'Messages' : '消息'} {detail.message_count}</span>
+        <span>{en ? 'Tool definitions' : '工具定义'} {detail.tool_definition_count}</span>
         <code>{detail.request_id}</code>
       </footer>
     </main>
@@ -357,9 +808,14 @@ function RequestDetail({
 }
 
 export default function App() {
+  const { language } = useLanguage()
+  const en = language === 'en'
   const [runs, setRuns] = useState<ContextRun[]>([])
   const [requests, setRequests] = useState<ContextRequestSummary[]>([])
   const [detail, setDetail] = useState<ContextRequestDetail | null>(null)
+  const [runsLoading, setRunsLoading] = useState(true)
+  const [requestsLoading, setRequestsLoading] = useState(false)
+  const [detailLoading, setDetailLoading] = useState(false)
   const [selectedRun, setSelectedRun] = useState<string | null>(null)
   const [selectedRequest, setSelectedRequest] = useState<string | null>(null)
   const [autoRefresh, setAutoRefresh] = useState(true)
@@ -370,40 +826,63 @@ export default function App() {
   )
   const [error, setError] = useState<string | null>(null)
   const [lastUpdated, setLastUpdated] = useState<number | null>(null)
+  const selectedRunLatestRequestTs = runs.find(
+    (run) => run.id === selectedRun,
+  )?.latest_request_ts ?? null
+  const selectedRequestResponseTs = requests.find(
+    (request) => request.request_id === selectedRequest,
+  )?.response_ts ?? null
 
   const loadRuns = useCallback(async (signal?: AbortSignal) => {
     const next = await fetchRuns(signal)
-    startTransition(() => {
-      setRuns(next)
-      setSelectedRun((current) => {
-        if (current && next.some((run) => run.id === current)) return current
-        return next.find((run) => run.request_count > 0)?.id || next[0]?.id || null
-      })
-      setLastUpdated(Date.now() / 1000)
+    setRuns(next)
+    setSelectedRun((current) => {
+      if (current && next.some((run) => run.id === current)) return current
+      return next.find((run) => run.request_count > 0)?.id || next[0]?.id || null
     })
+    setLastUpdated(Date.now() / 1000)
   }, [])
 
   useEffect(() => {
-    const controller = new AbortController()
-    loadRuns(controller.signal).catch((reason: Error) => setError(reason.message))
-    return () => controller.abort()
-  }, [loadRuns])
+    let cancelled = false
+    let controller: AbortController | null = null
+    let timer: number | null = null
 
-  useEffect(() => {
-    if (!autoRefresh) return
-    const timer = window.setInterval(() => {
-      loadRuns().catch((reason: Error) => setError(reason.message))
-    }, 2500)
-    return () => window.clearInterval(timer)
+    const refresh = async () => {
+      controller = new AbortController()
+      try {
+        await loadRuns(controller.signal)
+        if (!cancelled) setRunsLoading(false)
+      } catch (reason) {
+        const refreshError = reason as Error
+        if (!cancelled && refreshError.name !== 'AbortError') {
+          setRunsLoading(false)
+          setError(refreshError.message)
+        }
+      } finally {
+        if (!cancelled && autoRefresh) {
+          timer = window.setTimeout(refresh, 2500)
+        }
+      }
+    }
+
+    void refresh()
+    return () => {
+      cancelled = true
+      controller?.abort()
+      if (timer !== null) window.clearTimeout(timer)
+    }
   }, [autoRefresh, loadRuns])
 
   useEffect(() => {
     if (!selectedRun) {
       setRequests([])
       setSelectedRequest(null)
+      setRequestsLoading(false)
       return
     }
     const controller = new AbortController()
+    setRequestsLoading(true)
     fetchRequests(selectedRun, controller.signal)
       .then((next) => {
         startTransition(() => {
@@ -413,30 +892,59 @@ export default function App() {
               ? current
               : next[0]?.request_id || null
           ))
+          setRequestsLoading(false)
         })
       })
       .catch((reason: Error) => {
-        if (reason.name !== 'AbortError') setError(reason.message)
+        if (reason.name !== 'AbortError') {
+          setRequestsLoading(false)
+          setError(reason.message)
+        }
       })
     return () => controller.abort()
-  }, [selectedRun, runs])
+  }, [selectedRun, selectedRunLatestRequestTs])
 
   useEffect(() => {
     if (!selectedRun || !selectedRequest) {
       setDetail(null)
+      setDetailLoading(false)
       return
     }
     const controller = new AbortController()
+    setDetailLoading(true)
     fetchRequestDetail(selectedRun, selectedRequest, controller.signal)
       .then((next) => startTransition(() => {
         setDetail(next)
+        setDetailLoading(false)
         setError(null)
       }))
       .catch((reason: Error) => {
-        if (reason.name !== 'AbortError') setError(reason.message)
+        if (reason.name !== 'AbortError') {
+          setDetailLoading(false)
+          setError(reason.message)
+        }
       })
     return () => controller.abort()
-  }, [selectedRequest, selectedRun, requests])
+  }, [selectedRequest, selectedRequestResponseTs, selectedRun])
+
+  const selectRun = useCallback((id: string) => {
+    if (id === selectedRun) return
+    setSelectedRun(id)
+    setRequests([])
+    setSelectedRequest(null)
+    setDetail(null)
+    setRequestsLoading(true)
+    setDetailLoading(false)
+    setError(null)
+  }, [selectedRun])
+
+  const selectRequest = useCallback((id: string) => {
+    if (id === selectedRequest) return
+    setSelectedRequest(id)
+    setDetail(null)
+    setDetailLoading(true)
+    setError(null)
+  }, [selectedRequest])
 
   const toggleCategory = useCallback((category: ContextCategory) => {
     setCategories((current) => {
@@ -456,12 +964,12 @@ export default function App() {
         </div>
         <div className="connection-state">
           <span className="live-dot" />
-          <span>已连接</span>
+          <span>{en ? 'Connected' : '已连接'}</span>
           <code>localhost:8766</code>
-          <span>最后更新 {formatClock(lastUpdated)}</span>
+          <span>{en ? 'Updated' : '最后更新'} {formatClock(lastUpdated, language)}</span>
         </div>
         <label className="refresh-switch">
-          <span>自动刷新</span>
+          <span>{en ? 'Auto refresh' : '自动刷新'}</span>
           <input
             checked={autoRefresh}
             onChange={(event) => setAutoRefresh(event.target.checked)}
@@ -470,7 +978,7 @@ export default function App() {
           <i />
         </label>
         <div className="category-filters">
-          <span>类别筛选</span>
+          <span>{en ? 'Categories' : '类别筛选'}</span>
           <button
             aria-pressed={categories.size === filterCategories.length}
             className={categories.size === filterCategories.length ? 'filter-button all active' : 'filter-button all'}
@@ -481,7 +989,7 @@ export default function App() {
             )}
             type="button"
           >
-            全部
+            {en ? 'All' : '全部'}
           </button>
           {filterCategories.map((category) => (
             <CategoryFilter
@@ -499,7 +1007,7 @@ export default function App() {
           </svg>
           <input
             onChange={(event) => setSearch(event.target.value)}
-            placeholder="搜索消息、工具名或内容…"
+            placeholder={en ? 'Search messages, tools, or content…' : '搜索消息、工具名或内容…'}
             value={search}
           />
         </label>
@@ -507,12 +1015,13 @@ export default function App() {
           <a
             className="download-button"
             href={exportUrl(selectedRun, detail.request_id)}
-            title="导出原始请求 JSON"
+            title={en ? 'Export raw request JSON' : '导出原始请求 JSON'}
           >
             <DownloadIcon />
-            导出
+            {en ? 'Export' : '导出'}
           </a>
         ) : null}
+        <LanguageSwitcher className="context-language-switcher" />
       </header>
 
       {error ? (
@@ -523,26 +1032,32 @@ export default function App() {
 
       <div className="workspace-grid">
         <RunSidebar
-          onSelect={(id) => {
-            setSelectedRun(id)
-            setSelectedRequest(null)
-          }}
+          loading={runsLoading}
+          onSelect={selectRun}
           runs={runs}
           selectedId={selectedRun}
         />
         <RequestTimeline
-          onSelect={setSelectedRequest}
+          key={selectedRun || 'no-run'}
+          loading={requestsLoading}
+          onSelect={selectRequest}
           requests={requests}
           selectedId={selectedRequest}
         />
-        {detail ? (
+        {detailLoading ? (
+          <DetailLoading label={en ? 'Loading context…' : '正在加载 Context…'} />
+        ) : detail ? (
           <RequestDetail
             categories={categories}
             detail={detail}
             onRawChange={setRaw}
             raw={raw}
+            runId={selectedRun || ''}
+            runName={runs.find((run) => run.id === selectedRun)?.name || selectedRun || ''}
             search={search}
           />
+        ) : requestsLoading ? (
+          <DetailLoading label={en ? 'Loading conversation requests…' : '正在加载会话请求…'} />
         ) : <EmptyDetail />}
       </div>
     </div>

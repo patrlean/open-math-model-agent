@@ -36,4 +36,23 @@
 \VAR{s.body}
 
 \BLOCK{endfor}
+\BLOCK{if appendices}
+\clearpage
+\appendix
+\BLOCK{for appendix in appendices}
+\section{\VAR{appendix.heading}}
+\VAR{appendix.body}
+
+\BLOCK{endfor}
+\BLOCK{endif}
+\BLOCK{if references}
+\clearpage
+\phantomsection
+\addcontentsline{toc}{section}{\BLOCK{if cjk}参考文献\BLOCK{else}References\BLOCK{endif}}
+\begin{thebibliography}{99}
+\BLOCK{for reference in references}
+\bibitem{\VAR{reference.key}} \VAR{reference.text}
+\BLOCK{endfor}
+\end{thebibliography}
+\BLOCK{endif}
 \end{document}

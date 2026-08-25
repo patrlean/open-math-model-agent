@@ -1,0 +1,29 @@
+services:
+  dashboard:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.dashboard
+    container_name: mathmodel_harness_dashboard
+    working_dir: /opt/open-math-model-agent
+    command: ["python", "-m", "mathmodel.dashboard.server", "--host", "0.0.0.0", "--port", "8765"]
+    environment:
+      MATHMODEL_AUTH_PROFILE_URL: http://host.docker.internal:5001/api/user/balance
+      MATHMODEL_PUBLIC_DEPLOYMENT: "true"
+      MATHMODEL_CREDENTIAL_KEY_FILE: /opt/open-math-model-agent/.credential-key
+      MATHMODEL_RUN_STALE_SECONDS: "300"
+    env_file:
+      - ../.env
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - 127.0.0.1:8765:8765
+    volumes:
+      - ..:/opt/open-math-model-agent
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s

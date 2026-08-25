@@ -21,6 +21,7 @@ import numpy as np
 from mathmodel.latex.compile import compile_tex
 from mathmodel.latex.quality import inspect_paper
 from mathmodel.latex.render import render_report
+from mathmodel.latex.structure import inspect_latex_structure
 
 os.environ["PATH"] = os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin"
 
@@ -100,12 +101,57 @@ def run_case(d: Path, cjk: bool, tag: str) -> None:
     )
 
 
+def run_competition_case(d: Path, *, template: str, cjk: bool) -> None:
+    """Compile flexible headings plus template-owned appendix/references."""
+    context = {
+        "title": "结构化论文测试" if cjk else "Structured Paper Test",
+        "abstract": "结构化摘要。" if cjk else "A structured summary.",
+        "keywords": "结构, 模型" if cjk else "structure, model",
+        "cjk": cjk,
+        "sections": [
+            {"heading": "问题分析" if cjk else "Problem Analysis", "body": "正文一。" if cjk else "Main text one."},
+            {"heading": "微分方程模型" if cjk else "Differential Equation Framework", "body": "正文二。" if cjk else "Main text two."},
+            {"heading": "模型检验" if cjk else "Model Validation", "body": "正文三。" if cjk else "Main text three."},
+        ],
+        "appendices": [
+            {"heading": "补充代码" if cjk else "Supplementary Code", "body": "附录内容。" if cjk else "Appendix material."},
+        ],
+        "references": [
+            {"key": "smith2024", "text": "Smith A. Verified modeling reference. 2024."},
+        ],
+    }
+    tex = render_report(context, workdir=d, template=template)
+    assert not inspect_latex_structure(tex), inspect_latex_structure(tex)
+    assert tex.index(r"\appendix") < tex.index(r"\begin{thebibliography}")
+    assert tex.index(r"\end{thebibliography}") < tex.index(r"\end{document}")
+
+    tex_path = d / f"main_{template}.tex"
+    tex_path.write_text(tex)
+    res = compile_tex(tex_path)
+    assert res.ok, "\n".join(res.log.splitlines()[-30:])
+    metrics = inspect_paper(res.pdf_path, tex_path)
+    assert metrics.first_section_page == 2
+    assert metrics.appendix_start_page is not None
+    assert metrics.references_start_page is not None
+    assert metrics.counted_page_count < metrics.page_count
+    assert metrics.appendix_page_count >= 1
+    assert metrics.reference_page_count >= 1
+    print(
+        f"[{template}] total={metrics.page_count}, "
+        f"counted={metrics.counted_page_count}, "
+        f"appendix={metrics.appendix_page_count}, "
+        f"references={metrics.reference_page_count}"
+    )
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         d = Path(tmp)
         build_workdir(d)
         run_case(d, cjk=False, tag="en")
         run_case(d, cjk=True, tag="zh")
+        run_competition_case(d, template="cumcm", cjk=True)
+        run_competition_case(d, template="mcm-icm", cjk=False)
     print("\nOK: rendered + injected real results + compiled PDF (EN & ZH).")
 
 

@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 .provider-settings.json
+.credential-key
 
 # python
 .venv/
@@ -12,9 +13,14 @@ __pycache__/
 
 # per-run outputs
 workspace/
+experiments/
+
+# local benchmark inputs and generated experiment outputs
+/benchmark-v1/
 
 # temporary and local runtime files
 tmp/
+.runtime/
 *.log
 
 # frontend dependencies

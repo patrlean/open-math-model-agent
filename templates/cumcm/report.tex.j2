@@ -1,0 +1,52 @@
+%% Executable CUMCM paper template.
+%% MATHMODEL_TEMPLATE: cumcm
+%% MATHMODEL_REFERENCES_TOC_TITLE: 参考文献
+\documentclass[11pt]{ctexart}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\graphicspath{{../}{../figures/}{./}{figures/}}
+\usepackage{booktabs}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\pagestyle{plain}
+
+\begin{document}
+\begin{center}
+{\LARGE\bfseries \VAR{title}\par}
+\end{center}
+\BLOCK{if abstract}
+\begin{abstract}
+\VAR{abstract}
+\BLOCK{if keywords}
+
+\noindent\textbf{关键词：}\VAR{keywords}
+\BLOCK{endif}
+\end{abstract}
+\clearpage
+\BLOCK{endif}
+
+\BLOCK{for s in sections}
+\section{\VAR{s.heading}}
+\VAR{s.body}
+
+\BLOCK{endfor}
+\BLOCK{if appendices}
+\clearpage
+\appendix
+\BLOCK{for appendix in appendices}
+\section{\VAR{appendix.heading}}
+\VAR{appendix.body}
+
+\BLOCK{endfor}
+\BLOCK{endif}
+\BLOCK{if references}
+\clearpage
+\phantomsection
+\addcontentsline{toc}{section}{参考文献}
+\begin{thebibliography}{99}
+\BLOCK{for reference in references}
+\bibitem{\VAR{reference.key}} \VAR{reference.text}
+\BLOCK{endfor}
+\end{thebibliography}
+\BLOCK{endif}
+\end{document}

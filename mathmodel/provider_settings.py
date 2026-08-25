@@ -13,12 +13,33 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SETTINGS_PATH = PROJECT_ROOT / ".provider-settings.json"
 ENV_PATH = PROJECT_ROOT / ".env"
 
-PROVIDER_PRESETS: dict[str, dict[str, str]] = {
+DEEPSEEK_FLASH_MODEL = "deepseek-v4-flash"
+DEEPSEEK_PRO_MODEL = "deepseek-v4-pro"
+DEEPSEEK_REASONING_EFFORTS = ("low", "high", "max")
+DEFAULT_DEEPSEEK_REASONING_EFFORT = "high"
+
+DEEPSEEK_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
+    {
+        "id": DEEPSEEK_FLASH_MODEL,
+        "label": "Flash Model",
+        "description": "更快的默认模型",
+        "is_default": True,
+    },
+    {
+        "id": DEEPSEEK_PRO_MODEL,
+        "label": "Pro Model",
+        "description": "更强的复杂任务模型",
+        "is_default": False,
+    },
+)
+
+PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
     "deepseek": {
         "label": "DeepSeek",
-        "default_model": "deepseek-v4-pro",
+        "default_model": DEEPSEEK_FLASH_MODEL,
         "default_base_url": "https://api.deepseek.com",
         "api_key_env": "DEEPSEEK_API_KEY",
+        "model_options": DEEPSEEK_MODEL_OPTIONS,
     },
     "kimi": {
         "label": "Kimi",
@@ -41,6 +62,19 @@ PROVIDER_PRESETS: dict[str, dict[str, str]] = {
 }
 
 
+def _normalize_model(provider: str, model: str) -> str:
+    """Normalize known legacy DeepSeek names while preserving custom providers."""
+    normalized = model.strip()
+    if provider != "deepseek":
+        return normalized
+    aliases = {
+        "deepseek-v4-flash": DEEPSEEK_FLASH_MODEL,
+        "deepseek-v4-flash-0731": DEEPSEEK_FLASH_MODEL,
+        DEEPSEEK_PRO_MODEL.lower(): DEEPSEEK_PRO_MODEL,
+    }
+    return aliases.get(normalized.lower(), normalized)
+
+
 def read_provider_override(path: Path = SETTINGS_PATH) -> dict[str, str]:
     """Read non-secret provider metadata, ignoring malformed local state."""
     try:
@@ -52,11 +86,21 @@ def read_provider_override(path: Path = SETTINGS_PATH) -> dict[str, str]:
     provider = str(data.get("provider", "")).strip().lower()
     if provider not in PROVIDER_PRESETS:
         return {}
-    model = str(data.get("model", "")).strip()
+    model = _normalize_model(provider, str(data.get("model", "")))
     base_url = str(data.get("base_url", "")).strip().rstrip("/")
+    reasoning_effort = str(
+        data.get("reasoning_effort", DEFAULT_DEEPSEEK_REASONING_EFFORT)
+    ).strip().lower()
+    if reasoning_effort not in DEEPSEEK_REASONING_EFFORTS:
+        reasoning_effort = DEFAULT_DEEPSEEK_REASONING_EFFORT
     if not model or not base_url:
         return {}
-    return {"provider": provider, "model": model, "base_url": base_url}
+    return {
+        "provider": provider,
+        "model": model,
+        "base_url": base_url,
+        "reasoning_effort": reasoning_effort,
+    }
 
 
 def _validate_base_url(value: str) -> str:
@@ -70,6 +114,39 @@ def _validate_base_url(value: str) -> str:
     ):
         raise ValueError("Base URL 必须是有效的 HTTP(S) 地址，且不能包含查询参数。")
     return base_url
+
+
+def validate_provider_selection(
+    *,
+    provider: str,
+    model: str,
+    base_url: str,
+    reasoning_effort: str | None = None,
+) -> dict[str, str]:
+    """Validate non-secret provider metadata without persisting anything."""
+    provider_id = provider.strip().lower()
+    if provider_id not in PROVIDER_PRESETS:
+        raise ValueError("不支持这个模型供应商。")
+    normalized_model = _normalize_model(provider_id, model)
+    if not normalized_model:
+        raise ValueError("模型名称不能为空。")
+    model_options = PROVIDER_PRESETS[provider_id].get("model_options", ())
+    if model_options and normalized_model not in {
+        str(option["id"]) for option in model_options
+    }:
+        raise ValueError("DeepSeek 模型只能选择 Flash Model 或 Pro Model。")
+    normalized_base_url = _validate_base_url(base_url)
+    normalized_effort = str(
+        reasoning_effort or DEFAULT_DEEPSEEK_REASONING_EFFORT
+    ).strip().lower()
+    if normalized_effort not in DEEPSEEK_REASONING_EFFORTS:
+        raise ValueError("思考强度只能选择 low、high 或 max。")
+    return {
+        "provider": provider_id,
+        "model": normalized_model,
+        "base_url": normalized_base_url,
+        "reasoning_effort": normalized_effort,
+    }
 
 
 def _write_env_value(path: Path, name: str, value: str) -> None:
@@ -102,8 +179,11 @@ def provider_settings_payload(cfg: dict[str, Any]) -> dict[str, Any]:
     key = os.environ.get(preset["api_key_env"], "")
     return {
         "provider": provider,
-        "model": str(cfg.get("model", "")),
+        "model": _normalize_model(provider, str(cfg.get("model", ""))),
         "base_url": str(cfg.get("base_url", "")),
+        "reasoning_effort": str(
+            cfg.get("reasoning_effort", DEFAULT_DEEPSEEK_REASONING_EFFORT)
+        ),
         "api_key_configured": bool(key),
         "api_key_hint": f"••••{key[-4:]}" if key else None,
         "presets": [
@@ -112,6 +192,9 @@ def provider_settings_payload(cfg: dict[str, Any]) -> dict[str, Any]:
                 "label": values["label"],
                 "default_model": values["default_model"],
                 "default_base_url": values["default_base_url"],
+                "model_options": [
+                    dict(option) for option in values.get("model_options", ())
+                ],
                 "api_key_configured": bool(
                     os.environ.get(values["api_key_env"], "")
                 ),
@@ -133,17 +216,22 @@ def save_provider_settings(
     base_url: str,
     api_key: str | None,
     current_cfg: dict[str, Any],
+    reasoning_effort: str | None = None,
     settings_path: Path = SETTINGS_PATH,
     env_path: Path = ENV_PATH,
 ) -> dict[str, Any]:
     """Validate and atomically persist a provider selection and optional key."""
-    provider_id = provider.strip().lower()
-    if provider_id not in PROVIDER_PRESETS:
-        raise ValueError("不支持这个模型供应商。")
-    normalized_model = model.strip()
-    if not normalized_model:
-        raise ValueError("模型名称不能为空。")
-    normalized_base_url = _validate_base_url(base_url)
+    state = validate_provider_selection(
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        reasoning_effort=(
+            reasoning_effort or str(current_cfg.get(
+                "reasoning_effort", DEFAULT_DEEPSEEK_REASONING_EFFORT
+            ))
+        ),
+    )
+    provider_id = state["provider"]
     preset = PROVIDER_PRESETS[provider_id]
     key_name = preset["api_key_env"]
     submitted_key = (api_key or "").strip()
@@ -155,11 +243,6 @@ def save_provider_settings(
         _write_env_value(env_path, key_name, submitted_key)
         os.environ[key_name] = submitted_key
 
-    state = {
-        "provider": provider_id,
-        "model": normalized_model,
-        "base_url": normalized_base_url,
-    }
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = settings_path.with_name(f".{settings_path.name}.tmp")
     temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")

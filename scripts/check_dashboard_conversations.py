@@ -20,7 +20,9 @@ def main() -> None:
             server.WORKSPACE = workspace
 
             draft_id, draft_name = server.create_draft()
-            assert draft_name == "新建会话"
+            assert draft_name == "新建项目"
+            draft_detail = server.run_detail(draft_id)
+            assert draft_detail["project"]["current_revision_id"] == "rev_0001"
             try:
                 server.create_draft()
             except server.RunStateError as exc:
@@ -84,6 +86,14 @@ def main() -> None:
             reset_verifier_settings = server.update_verifier_settings("legacy-file-title", None)
             assert reset_verifier_settings["max_steps"] == server._default_verifier_steps()
             assert reset_verifier_settings["is_custom"] is False
+
+            agent_settings = server.update_agent_settings("legacy-file-title", 240)
+            assert agent_settings["max_steps"] == 240
+            assert agent_settings["is_custom"] is True
+            reset_agent_settings = server.update_agent_settings("legacy-file-title", None)
+            assert reset_agent_settings["max_steps"] == 200
+            assert reset_agent_settings["default_max_steps"] == 200
+            assert reset_agent_settings["is_custom"] is False
 
             subagent_settings = server.update_subagent_settings("legacy-file-title", 72)
             assert subagent_settings["max_steps"] == 72

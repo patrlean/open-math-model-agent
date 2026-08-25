@@ -16,7 +16,12 @@ from ..config import build_provider, build_sandbox
 from ..providers.base import Usage
 from ..tools.ask_user import make_ask_user_tool
 from ..tools.base import ToolContext, ToolRegistry
+from ..tools.describe_image import describe_image_tool
 from ..tools.edit_paragraph import edit_paragraph_tool, inspect_paper_blocks_tool
+from ..tools.ingest_problem import (
+    make_ingest_problem_tool,
+    make_promote_materials_tool,
+)
 from ..tools.plan import log_decision_tool, plan_write_tool, set_task_status_tool
 from ..tools.read_file import read_file_tool
 from ..tools.results_store import results_get_tool, results_list_tool
@@ -98,7 +103,7 @@ def session_state_path(workdir: str | Path) -> Path:
 def build_agent(
     cfg: dict[str, Any],
     workdir: str | Path,
-    max_steps: int = 60,
+    max_steps: int = 200,
     sub_max_steps: int = 60,
     on_event: Callable[[str, dict], None] | None = None,
     stop_event: threading.Event | None = None,
@@ -107,6 +112,9 @@ def build_agent(
     state_write_allowed: Callable[[], bool] | None = None,
     verification_enabled: bool | None = None,
     verification_attempt_limit: Callable[[], int] | None = None,
+    pending_problem_text: str = "",
+    pending_upload_paths: tuple[str | Path, ...] = (),
+    on_ingested: Callable[[Any], None] | None = None,
 ) -> Agent:
     """Build the lead Agent. If `resume` and a prior session_state.json exists in
     `workdir`, the conversation (messages/usage/counters) picks up from there
@@ -121,7 +129,18 @@ def build_agent(
                        run_counter=dict((state or {}).get("run_counter") or {}),
                        stop_event=stop_event or threading.Event(),
                        settings=cfg)
-    threshold = cfg["context"]["compact_threshold_tokens"]
+    context_cfg = cfg["context"]
+    threshold = int(context_cfg["compact_threshold_tokens"])
+    keep_tail_messages = int(context_cfg.get("keep_tail_messages", 12))
+    compaction_strategy = str(
+        context_cfg.get("compaction_strategy", "legacy_monolithic")
+    )
+    tool_result_externalize_threshold_tokens = int(
+        context_cfg.get("tool_result_externalize_threshold_tokens", 1_000)
+    )
+    tool_result_preview_chars = int(
+        context_cfg.get("tool_result_preview_chars", 600)
+    )
 
     def build_sub_registry() -> ToolRegistry:
         r = ToolRegistry()
@@ -131,11 +150,29 @@ def build_agent(
 
     spawn_tool, collect_subagents_tool, subagent_manager = make_background_subagent_tools(
         provider, build_sub_registry, SUBAGENT_SYSTEM,
-        compact_threshold_tokens=threshold, max_steps=sub_max_steps,
+        compact_threshold_tokens=threshold,
+        keep_tail_messages=keep_tail_messages,
+        compaction_strategy=compaction_strategy,
+        tool_result_externalize_threshold_tokens=(
+            tool_result_externalize_threshold_tokens
+        ),
+        tool_result_preview_chars=tool_result_preview_chars,
+        max_steps=sub_max_steps,
         on_event=on_event,
     )
 
-    lead_only = (*_LEAD_ONLY_STATIC, make_ask_user_tool(on_event=on_event))
+    ingest_problem_tool = make_ingest_problem_tool(
+        problem_text=pending_problem_text,
+        upload_paths=pending_upload_paths,
+        on_ingested=on_ingested,
+    )
+    lead_only = (
+        ingest_problem_tool,
+        make_promote_materials_tool(),
+        describe_image_tool(),
+        *_LEAD_ONLY_STATIC,
+        make_ask_user_tool(on_event=on_event),
+    )
 
     registry = ToolRegistry()
     for t in (*_SUB_TOOLS, *lead_only, spawn_tool, collect_subagents_tool):
@@ -181,6 +218,12 @@ def build_agent(
     return Agent(
         provider=provider, registry=registry, ctx=ctx,
         system_prompt=system_prompt, compact_threshold_tokens=threshold,
+        keep_tail_messages=keep_tail_messages,
+        compaction_strategy=compaction_strategy,
+        tool_result_externalize_threshold_tokens=(
+            tool_result_externalize_threshold_tokens
+        ),
+        tool_result_preview_chars=tool_result_preview_chars,
         max_steps=max_steps, on_event=on_event,
         initial_messages=(state or {}).get("messages"),
         initial_usage=initial_usage,
@@ -235,12 +278,23 @@ def build_chat_agent(
     if state and state.get("total_usage"):
         initial_usage = _usage_from_state(state["total_usage"])
 
+    context_cfg = cfg["context"]
     return Agent(
         provider=provider,
         registry=registry,
         ctx=ctx,
         system_prompt=CHAT_SYSTEM,
-        compact_threshold_tokens=cfg["context"]["compact_threshold_tokens"],
+        compact_threshold_tokens=int(context_cfg["compact_threshold_tokens"]),
+        keep_tail_messages=int(context_cfg.get("keep_tail_messages", 12)),
+        compaction_strategy=str(
+            context_cfg.get("compaction_strategy", "legacy_monolithic")
+        ),
+        tool_result_externalize_threshold_tokens=int(
+            context_cfg.get("tool_result_externalize_threshold_tokens", 1_000)
+        ),
+        tool_result_preview_chars=int(
+            context_cfg.get("tool_result_preview_chars", 600)
+        ),
         # search -> fetch -> answer normally needs three model turns; one extra
         # turn leaves room to recover from an empty or unavailable result.
         max_steps=4,

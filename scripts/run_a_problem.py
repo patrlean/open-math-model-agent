@@ -70,7 +70,7 @@ def main() -> None:
 
     log_path = workdir / "run.log"
     on_event = compose(make_logger(log_path), JsonlLogger(workdir / "events.jsonl"))
-    agent = build_agent(cfg, workdir, max_steps=80, sub_max_steps=60,
+    agent = build_agent(cfg, workdir, max_steps=200, sub_max_steps=60,
                         on_event=on_event)
 
     task = (

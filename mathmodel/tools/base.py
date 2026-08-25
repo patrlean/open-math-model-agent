@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from ..providers.base import Usage
 from ..sandbox.base import Sandbox
 
 TOOL_HEARTBEAT_SECONDS = 30.0
@@ -45,11 +46,34 @@ class ToolContext:
         default=TOOL_HEARTBEAT_SECONDS,
         repr=False,
     )
+    # Some tools call a separately billed model (for example Kimi K3 for image
+    # understanding). The Agent drains these records after a tool-call batch so
+    # their tokens and cost become part of the same persisted conversation bill.
+    _model_usage_records: list[tuple[Usage, dict[str, Any]]] = field(
+        default_factory=list,
+        repr=False,
+    )
+    _model_usage_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        repr=False,
+    )
 
     def next_index(self, key: str) -> int:
         with self._counter_lock:
             self.run_counter[key] = self.run_counter.get(key, 0) + 1
             return self.run_counter[key]
+
+    def record_model_usage(self, usage: Usage, **metadata: Any) -> None:
+        """Queue one externally billed model call for Agent-owned accounting."""
+        with self._model_usage_lock:
+            self._model_usage_records.append((usage, dict(metadata)))
+
+    def take_model_usage_records(self) -> list[tuple[Usage, dict[str, Any]]]:
+        """Atomically drain model calls completed by the latest tool batch."""
+        with self._model_usage_lock:
+            records = self._model_usage_records
+            self._model_usage_records = []
+            return records
 
 
 Handler = Callable[[ToolContext, dict[str, Any]], str]

@@ -35,7 +35,9 @@ import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
 
 # tectonic / docker must be findable from agent runs launched in-process.
 os.environ["PATH"] = os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin:/Library/TeX/texbin"
@@ -46,6 +48,24 @@ from ..contextlog import CONTEXT_LOG_FILENAME, ContextRecorder  # noqa: E402
 from ..provider_settings import (  # noqa: E402
     provider_settings_payload,
     save_provider_settings,
+)
+from ..user_provider_settings import (  # noqa: E402
+    runtime_override as user_provider_runtime_override,
+    save_account_settings as save_user_provider_settings,
+    settings_payload as user_provider_settings_payload,
+)
+from ..project_state import (  # noqa: E402
+    ensure_project,
+    mark_active_revision_completed,
+    project_budget_settings,
+    project_view,
+    resolve_change_request,
+    update_active_revision_status,
+    update_project_budget_limit,
+)
+from ..sandbox.docker import (  # noqa: E402
+    ContainerCleanupResult,
+    cleanup_managed_containers,
 )
 
 WORKSPACE = PROJECT_ROOT / "workspace"
@@ -69,19 +89,29 @@ _STOP_LOCK = threading.RLock()
 _STOP_EVENTS: dict[str, threading.Event] = {}
 _VERIFICATION_ATTEMPTS_MIN = 1
 _VERIFICATION_ATTEMPTS_MAX = 10
-_MAIN_AGENT_STEPS_DEFAULT = 80
+_MAIN_AGENT_STEPS_DEFAULT = 200
 _MAIN_AGENT_STEPS_MIN = 10
 _MAIN_AGENT_STEPS_MAX = 300
+_MAIN_AGENT_STEPS_EXTENSION = 40
 _SUBAGENT_STEPS_DEFAULT = 60
 _SUBAGENT_STEPS_MIN = 5
 _SUBAGENT_STEPS_MAX = 300
 _VERIFIER_STEPS_MIN = 4
 _VERIFIER_STEPS_MAX = 512
 _PROVIDER_SETTINGS_LOCK = threading.RLock()
+_REQUEST_SCOPE = threading.local()
+_AUTH_PROFILE_URL = os.environ.get("MATHMODEL_AUTH_PROFILE_URL", "").strip()
+_PUBLIC_DEPLOYMENT = os.environ.get("MATHMODEL_PUBLIC_DEPLOYMENT", "").lower() in {
+    "1", "true", "yes", "on",
+}
 
 
 class RunStateError(ValueError):
     """Raised when a requested conversation transition is not allowed."""
+
+
+class AuthenticationError(ValueError):
+    """Raised when a public dashboard request has no valid account token."""
 
 
 # --------------------------------------------------------------------------- io
@@ -92,11 +122,37 @@ def _read(p: Path) -> str:
         return ""
 
 
+def _workspace() -> Path:
+    """Return the conversation root visible to the current request.
+
+    The upstream project is intentionally local-first. Public deployments opt
+    into account-backed request scoping, which keeps every user's run list and
+    artifacts in a separate directory while preserving the original local
+    single-user layout by default.
+    """
+    if not _AUTH_PROFILE_URL:
+        return WORKSPACE
+    user_id = str(getattr(_REQUEST_SCOPE, "user_id", "")).strip()
+    if not user_id:
+        raise AuthenticationError("authentication required")
+    safe_user_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", user_id).strip("._")
+    if not safe_user_id:
+        raise AuthenticationError("invalid authenticated user")
+    return WORKSPACE / ".users" / safe_user_id
+
+
 def _run_dir(run_id: str) -> Path:
-    d = (WORKSPACE / run_id).resolve()
-    if not str(d).startswith(str(WORKSPACE.resolve())):
+    workspace = _workspace().resolve()
+    d = (workspace / run_id).resolve()
+    if not run_id or d == workspace or workspace not in d.parents:
         raise ValueError("bad run id")
     return d
+
+
+def _provider_settings_payload() -> dict:
+    if _PUBLIC_DEPLOYMENT and _AUTH_PROFILE_URL:
+        return user_provider_settings_payload(_CFG, _workspace())
+    return provider_settings_payload(_CFG)
 
 
 def _meta(d: Path) -> dict:
@@ -250,20 +306,61 @@ def _run_status(d: Path) -> str:
     if status == "running":
         idle_seconds = time.time() - _last_activity(d, m)
         if idle_seconds > RUN_STALE_SECONDS:
-            reason = (
-                f"超过 {RUN_STALE_SECONDS // 60} 分钟没有新的运行记录，"
-                "已自动标记为异常。请重新开始本次会话。"
-            )
-            _set_status(d, "error", failure_reason=reason)
-            return "error"
+            # An in-process worker lease is stronger evidence than event-file
+            # freshness. Long model requests now emit provider heartbeats too,
+            # but this guard also closes the race where status polling happens
+            # just before the next heartbeat is durably appended.
+            stale_without_worker = False
+            with _STOP_LOCK:
+                if d.name in _STOP_EVENTS:
+                    return "running"
+                # Re-read under the lifecycle lock in case a worker started or
+                # emitted an event between the first check and lock acquisition.
+                current = _meta(d)
+                if current.get("status") != "running":
+                    return str(current.get("status") or "unknown")
+                if time.time() - _last_activity(d, current) <= RUN_STALE_SECONDS:
+                    return "running"
+                reason = (
+                    f"超过 {RUN_STALE_SECONDS // 60} 分钟没有新的运行记录，"
+                    "且没有活动的运行线程，已自动标记为异常。"
+                    "请重新开始本次会话。"
+                )
+                _set_status(d, "error", failure_reason=reason)
+                stale_without_worker = True
+            if stale_without_worker:
+                cleanup_managed_containers(d)
+                return "error"
     return status
 
 
+def _last_lead_stop_reason(d: Path) -> str | None:
+    """Recover the latest lead-run boundary for conversations created before
+    ``meta.stop_reason`` was persisted. Sub-agent max-step events must never
+    make the main conversation eligible for one-click continuation.
+    """
+    events_path = d / "events.jsonl"
+    if not events_path.is_file():
+        return None
+    for line in reversed(events_path.read_text(errors="replace").splitlines()):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("subagent") is not None:
+            continue
+        kind = str(event.get("kind") or "")
+        if kind in {"max_steps", "cancelled", "done", "task"}:
+            return kind
+    return None
+
+
 def list_runs() -> list[dict]:
-    if not WORKSPACE.is_dir():
+    workspace = _workspace()
+    if not workspace.is_dir():
         return []
     runs = []
-    for d in WORKSPACE.iterdir():
+    for d in workspace.iterdir():
         if not d.is_dir():
             continue
         status = _run_status(d)
@@ -403,8 +500,28 @@ def _conversation_usage(
         state = {}
     lead_usage = state.get("total_usage")
     _add_usage_summary(total, lead_usage)
+    external_models: dict[tuple[str, str, str], dict] = {}
 
     for event in events:
+        if event.get("kind") == "external_model_usage":
+            key = (
+                str(event.get("tool") or "external_model"),
+                str(event.get("provider") or "unknown"),
+                str(event.get("model") or "unknown"),
+            )
+            entry = external_models.setdefault(
+                key,
+                {
+                    "tool": key[0],
+                    "provider": key[1],
+                    "model": key[2],
+                    **_empty_usage_summary(),
+                },
+            )
+            # This is a breakdown only. The same usage is already persisted in
+            # the lead Agent state and therefore must not be added twice.
+            _add_usage_summary(entry, event.get("usage"))
+            continue
         if event.get("kind") == "routing_usage":
             _add_usage_summary(total, event.get("usage"))
             continue
@@ -432,14 +549,33 @@ def _conversation_usage(
     )
     total["pricing_complete"] = total["unpriced_tokens"] == 0
     total["currency"] = "CNY"
-    total["rates_per_million"] = copy.deepcopy(
-        _CFG.get("pricing", {}).get("deepseek_cny_per_million", {})
+    pricing = _CFG.get("pricing", {})
+    rates_by_model = pricing.get("deepseek_cny_per_million", {})
+    active_rates = (
+        rates_by_model.get(str(_CFG.get("model", "")).lower(), {})
+        if isinstance(rates_by_model, dict) else {}
     )
+    total["rates_per_million"] = copy.deepcopy(active_rates)
+    total["pricing_policy"] = {
+        "rates_by_model": copy.deepcopy(rates_by_model),
+        "peak": copy.deepcopy(pricing.get("deepseek_peak", {})),
+    }
+    total["external_model_usage"] = [
+        {
+            **entry,
+            "estimated_cost_cny": round(entry["estimated_cost_cny"], 6),
+            "cache_breakdown_complete": entry["unclassified_input_tokens"] == 0,
+            "pricing_complete": entry["unpriced_tokens"] == 0,
+        }
+        for entry in external_models.values()
+    ]
     return total
 
 
 def run_detail(run_id: str) -> dict:
     d = _run_dir(run_id)
+    if not d.is_dir():
+        raise ValueError("run not found")
     events = []
     ev = d / "events.jsonl"
     if ev.exists():
@@ -520,6 +656,46 @@ def run_detail(run_id: str) -> dict:
             plan_tasks = []
     status = _run_status(d)
     m = _meta(d)
+    project_was_bootstrapped = not (d / "project.json").is_file()
+    project = project_view(
+        d,
+        title=_resolved_run_name(d, m),
+        created_at=m.get("created"),
+    )
+    if project_was_bootstrapped:
+        if status == "done":
+            verified = False
+            try:
+                verified = json.loads(
+                    (d / "verification" / "report.json").read_text()
+                ).get("verdict") == "PASS"
+            except (OSError, json.JSONDecodeError, AttributeError):
+                pass
+            mark_active_revision_completed(d, verified=verified)
+        else:
+            update_active_revision_status(d, status)
+        project = project_view(d, title=_resolved_run_name(d, m))
+    elif status == "done":
+        # Older builds reopened the accepted current revision as `running` on
+        # every conversational follow-up.  If that revision had already
+        # completed, repair the display/state on read without inventing a new
+        # historical revision or snapshot.
+        active_revision = project.get("active_revision") or {}
+        if (
+            active_revision.get("id") == project.get("current_revision_id")
+            and active_revision.get("completed_at") is not None
+            and active_revision.get("status") in {"running", "waiting_input"}
+        ):
+            verified = False
+            try:
+                verified = json.loads(
+                    (d / "verification" / "report.json").read_text()
+                ).get("verdict") == "PASS"
+            except (OSError, json.JSONDecodeError, AttributeError):
+                pass
+            mark_active_revision_completed(d, verified=verified)
+            project = project_view(d, title=_resolved_run_name(d, m))
+    project["deliverable_revisions"] = _revision_deliverables(d, project)
     pending_question = None
     pq = d / "pending_question.json"
     if pq.exists():
@@ -540,12 +716,16 @@ def run_detail(run_id: str) -> dict:
         ],
         "created": m.get("created"),
         "status": status,
+        "stop_reason": m.get("stop_reason") or (
+            _last_lead_stop_reason(d) if status == "stopped" else None
+        ),
         "plan": _read(d / "plan.md"),
         "plan_tasks": plan_tasks,
         "problem": _read(d / "problem.md"),
         "decisions": _read(d / "decisions.md"),
         "results": results,
         "figures": [p.name for p in sorted((d / "figures").glob("*"))] if (d / "figures").is_dir() else [],
+        "source_files": _source_deliverables(d),
         "outputs": [p.name for p in sorted(d.glob("*.xlsx"))],
         "paper": paper,
         "events": events,
@@ -560,6 +740,8 @@ def run_detail(run_id: str) -> dict:
         "subagent_settings": _subagent_settings(d),
         "verifier_settings": _verifier_settings(d),
         "usage": usage,
+        "project": project,
+        "project_budget_settings": project_budget_settings(d),
     }
 
 
@@ -738,15 +920,101 @@ def _paper_delivery(workdir: Path) -> dict[str, str]:
     return result
 
 
+_SOURCE_DELIVERY_SUFFIXES = {
+    ".c", ".cc", ".cpp", ".h", ".hpp", ".ipynb", ".jl", ".js",
+    ".jsx", ".m", ".py", ".r", ".rs", ".sh", ".sql", ".ts", ".tsx",
+}
+
+
+def _source_deliverables(workdir: Path) -> list[dict[str, object]]:
+    """List downloadable source files without embedding code in the run API."""
+    candidates: set[Path] = set()
+    source_dir = workdir / "src"
+    if source_dir.is_dir():
+        candidates.update(path for path in source_dir.rglob("*") if path.is_file())
+    candidates.update(
+        path for path in workdir.iterdir()
+        if path.is_file() and path.suffix.lower() in _SOURCE_DELIVERY_SUFFIXES
+    )
+    delivered: list[dict[str, object]] = []
+    for path in sorted(candidates):
+        relative = path.relative_to(workdir)
+        if (
+            path.suffix.lower() not in _SOURCE_DELIVERY_SUFFIXES
+            or any(part.startswith(".") or part == "__pycache__" for part in relative.parts)
+        ):
+            continue
+        delivered.append({
+            "path": relative.as_posix(),
+            "name": relative.relative_to("src").as_posix()
+            if relative.parts[0] == "src" else relative.as_posix(),
+            "size": path.stat().st_size,
+        })
+    return delivered[:200]
+
+
+def _revision_deliverables(
+    workdir: Path,
+    project: dict[str, object],
+) -> list[dict[str, object]]:
+    """Resolve paper and code downloads for each durable project revision."""
+    current_id = project.get("current_revision_id")
+    active_id = project.get("active_revision_id")
+    deliveries: list[dict[str, object]] = []
+    for revision in project.get("revisions", []):
+        if not isinstance(revision, dict):
+            continue
+        revision_id = str(revision.get("id") or "")
+        snapshot_path = revision.get("snapshot_path")
+        artifact_root: Path | None = None
+        prefix = ""
+        if isinstance(snapshot_path, str) and snapshot_path:
+            candidate = (workdir / snapshot_path).resolve()
+            if str(candidate).startswith(str(workdir.resolve())) and candidate.is_dir():
+                artifact_root = candidate
+                prefix = f"{Path(snapshot_path).as_posix().rstrip('/')}/"
+        elif revision_id == active_id or (
+            revision_id == current_id and active_id == current_id
+        ):
+            artifact_root = workdir
+
+        paper: dict[str, str] = {}
+        source_files: list[dict[str, object]] = []
+        if artifact_root is not None:
+            paper = _paper_delivery(artifact_root)
+            for key in ("pdf", "tex"):
+                if key in paper:
+                    paper[key] = prefix + paper[key]
+            source_files = _source_deliverables(artifact_root)
+            if prefix:
+                for source_file in source_files:
+                    source_file["path"] = prefix + str(source_file["path"])
+
+        deliveries.append({
+            "revision_id": revision_id,
+            "number": int(revision.get("number") or 0),
+            "title": str(revision.get("title") or ""),
+            "summary": str(revision.get("summary") or ""),
+            "status": str(revision.get("status") or ""),
+            "is_current": revision_id == current_id,
+            "is_active": revision_id == active_id,
+            "paper": paper,
+            "source_files": source_files,
+        })
+    return deliveries
+
+
 def _new_run_dir(label: str) -> tuple[str, Path]:
     """Allocate a unique run directory without overwriting a fast double-click."""
+    workspace = _workspace()
+    workspace.mkdir(parents=True, exist_ok=True)
     stem = time.strftime("%Y%m%d-%H%M%S") + "_" + _safe_name(label)
     run_id = stem
     n = 2
-    while (WORKSPACE / run_id).exists():
+    while (workspace / run_id).exists():
         run_id = f"{stem}_{n}"
         n += 1
-    return run_id, WORKSPACE / run_id
+    return run_id, workspace / run_id
 
 
 def _unsubmitted_draft() -> dict | None:
@@ -769,13 +1037,14 @@ def create_draft() -> tuple[str, str]:
     """Create a visible, not-yet-running workspace entry for a new conversation."""
     with _META_LOCK:
         _ensure_new_run_allowed()
-        display_name = "新建会话"
+        display_name = "新建项目"
         run_id, workdir = _new_run_dir("draft")
         workdir.mkdir(parents=True)
         _write_meta(workdir, {
             "name": display_name, "task": "", "created": time.time(),
             "status": "draft", "files": [],
         })
+        ensure_project(workdir, title=display_name)
     return run_id, display_name
 
 
@@ -790,7 +1059,7 @@ def launch_task(
     subagent_max_steps: int | None = None,
     verification_agent_max_steps: int | None = None,
 ) -> tuple[str, str]:
-    """Create a run workdir, save+ingest files, and run the agent in a thread."""
+    """Create a run workdir, save inputs, and run the unified Agent in a thread."""
     display_name = name.strip() or _generated_run_name(task, files)
     if draft_id:
         run_id = draft_id
@@ -820,6 +1089,7 @@ def launch_task(
     _write_meta(workdir, {
         "name": display_name, "task": task, "created": created,
         "status": "running", "files": [p.name for p in saved],
+        "mode": "conversation",
         "name_auto_generated": not bool(name.strip()),
         "last_activity": time.time(),
         **(
@@ -856,23 +1126,38 @@ def launch_task(
         ),
         **({"retry_of": retry_of} if retry_of else {}),
     })
+    ensure_project(workdir, title=display_name, created_at=created)
 
     _start_agent_thread(run_id, workdir, task, saved, resume=False)
     return run_id, display_name
 
 
 def _start_agent_thread(
-    run_id: str, workdir: Path, task: str, saved: list[Path], *, resume: bool,
+    run_id: str,
+    workdir: Path,
+    task: str,
+    saved: list[Path],
+    *,
+    resume: bool,
+    max_steps_override: int | None = None,
+    internal_instruction: bool = False,
+    pending_answer: dict | None = None,
 ) -> None:
     """Register a stop_event and start the background thread that drives one
     agent.run() call (fresh or resumed) in `workdir`. Shared by launch_task
     (resume=False: always starts an empty conversation) and continue_task
     (resume=True: picks up from session_state.json -- see agent/build.py).
     """
-    from ..agent.build import build_agent, build_chat_agent
-    from ..agent.intent import route_new_message
-    from ..ingest.ingest import ingest
+    from ..agent.build import build_agent
     from ..runlog import JsonlLogger
+
+    # Authentication is request-thread local. Resolve the account's encrypted
+    # provider choice before starting the background worker, then keep it only
+    # in this run's in-memory config copy.
+    provider_override = (
+        user_provider_runtime_override(_workspace())
+        if _PUBLIC_DEPLOYMENT and _AUTH_PROFILE_URL else {}
+    )
 
     # Register before the thread starts so a stop request arriving in the gap
     # between launch and worker startup can still invalidate this generation.
@@ -882,21 +1167,67 @@ def _start_agent_thread(
     with _STOP_LOCK:
         if run_id in _STOP_EVENTS:
             raise RunStateError("这次会话已经在继续处理中，请先停止当前会话。")
-        if resume and _run_status(workdir) not in _CONTINUABLE_STATUSES:
+        resume_statuses = (
+            _CONTINUABLE_STATUSES | {"waiting_input"}
+            if pending_answer is not None
+            else _CONTINUABLE_STATUSES
+        )
+        if resume and _run_status(workdir) not in resume_statuses:
             raise RunStateError("只有已完成、已停止、已中断或异常的会话才能继续。")
         _STOP_EVENTS[run_id] = stop_event
-        _set_status(workdir, "running")
+        _set_status(
+            workdir,
+            "running",
+            sync_project=pending_answer is None,
+        )
 
     def is_current_worker() -> bool:
         return _STOP_EVENTS.get(run_id) is stop_event
 
-    def finish_if_current(status: str, failure_reason: str | None = None) -> None:
-        """Publish a terminal state only if this generation still owns the run."""
+    def finish_if_current(
+        status: str,
+        failure_reason: str | None = None,
+        *,
+        stop_reason: str | None = None,
+    ) -> None:
+        """Publish a terminal state and retire all work owned by this generation."""
         with _STOP_LOCK:
             if not is_current_worker():
                 return
-            _set_status(workdir, status, failure_reason=failure_reason)
+            # All main/sub-agent sandboxes for this generation share this
+            # cancellation event. Set it before dropping the worker lease so
+            # an abnormal lead-agent exit cannot leave a run_code poller alive.
+            stop_event.set()
+            _set_status(
+                workdir,
+                status,
+                failure_reason=failure_reason,
+                stop_reason=stop_reason,
+            )
+            should_complete_revision = (
+                not resume
+                or (internal_instruction and pending_answer is None)
+                or (
+                    pending_answer is not None
+                    and (pending_answer.get("result") or {}).get("change_action")
+                    == "confirm"
+                )
+            )
+            if status == "done" and should_complete_revision:
+                verified = False
+                report_path = workdir / "verification" / "report.json"
+                try:
+                    verified = (
+                        json.loads(report_path.read_text()).get("verdict") == "PASS"
+                    )
+                except (OSError, json.JSONDecodeError, AttributeError):
+                    pass
+                mark_active_revision_completed(workdir, verified=verified)
             _STOP_EVENTS.pop(run_id, None)
+        # The stop event normally lets each DockerSandbox remove itself within
+        # one poll interval. This labeled sweep is the deterministic fallback
+        # for a sandbox thread that also failed before reaching its own cleanup.
+        cleanup_managed_containers(workdir)
 
     def worker():
         try:
@@ -919,118 +1250,137 @@ def _start_agent_thread(
             # the modeling dashboard never receives them. A separate local
             # Context Inspector process reads this append-only log.
             runtime_cfg = copy.deepcopy(_CFG)
+            runtime_cfg.update(provider_override)
             runtime_cfg["_context_request_observer"] = ContextRecorder(
                 workdir / CONTEXT_LOG_FILENAME,
                 run_id,
             )
             meta = _meta(workdir)
-            prior_mode = str(meta.get("mode") or "")
-            # Conversations created before intent routing was introduced were
-            # all modeling sessions. Preserve that behavior when they resume;
-            # otherwise a short follow-up such as "继续" could accidentally
-            # rebuild a legacy modeling conversation as tool-free chat.
-            if resume and prior_mode not in {"chat", "modeling"}:
-                prior_mode = "modeling"
-            if prior_mode == "modeling":
-                mode = "modeling"
-            else:
-                mode = route_new_message(
-                    runtime_cfg,
-                    task,
-                    has_files=bool(saved),
-                    on_usage=lambda usage: on_event(
-                        "routing_usage",
-                        {"usage": usage.to_dict()},
-                    ),
-                )
-            switched_to_modeling = resume and prior_mode == "chat" and mode == "modeling"
-
-            with _META_LOCK:
-                meta = _meta(workdir)
-                meta["mode"] = mode
-                _write_meta(workdir, meta)
-
             if stop_event.is_set():
                 return
 
-            if mode == "chat":
-                agent = build_chat_agent(
-                    runtime_cfg,
-                    workdir,
-                    on_event=on_event,
-                    stop_event=stop_event,
-                    resume=resume,
-                    state_lock=_STOP_LOCK,
-                    state_write_allowed=is_current_worker,
-                )
-                full = task
-            else:
-                # A fresh modeling task always has one canonical problem.md:
-                # direct composer text and uploaded material extractions are
-                # merged there. Follow-up uploads append without rewriting the
-                # original problem statement.
-                if not resume or switched_to_modeling:
-                    ingest(
-                        [str(p) for p in saved],
-                        workdir,
-                        problem_text=task,
-                    )
-                elif saved:
-                    ingest([str(p) for p in saved], workdir)
-                elif not (workdir / "problem.md").is_file():
-                    # Backfill direct-text modeling conversations created by
-                    # older dashboard versions, which passed the prompt only
-                    # through chat history and never created problem.md.
-                    ingest(
-                        [],
-                        workdir,
-                        problem_text=str(meta.get("task") or task),
-                    )
+            prior_mode = str(meta.get("mode") or "")
+            modeling_was_active = (
+                prior_mode == "modeling" or (workdir / "problem.md").is_file()
+            )
+            if modeling_was_active and prior_mode != "modeling":
+                with _META_LOCK:
+                    current = _meta(workdir)
+                    current["mode"] = "modeling"
+                    _write_meta(workdir, current)
 
+            def on_ingested(report) -> None:
+                # The Agent's tool call, rather than a separate classifier, is
+                # the durable transition into the modeling lifecycle.
+                with _META_LOCK:
+                    current = _meta(workdir)
+                    current["mode"] = "modeling"
+                    _write_meta(workdir, current)
                 _refresh_generated_run_name(workdir)
-                run_cfg = runtime_cfg
-                run_cfg.setdefault("verification", {})["max_steps"] = (
-                    _verifier_settings(workdir)["max_steps"]
+
+            run_cfg = runtime_cfg
+            run_cfg.setdefault("verification", {})["max_steps"] = (
+                _verifier_settings(workdir)["max_steps"]
+            )
+            agent = build_agent(
+                run_cfg,
+                workdir,
+                max_steps=(
+                    max_steps_override
+                    if max_steps_override is not None
+                    else _agent_settings(workdir)["max_steps"]
+                ),
+                sub_max_steps=_subagent_settings(workdir)["max_steps"],
+                on_event=on_event,
+                stop_event=stop_event,
+                resume=resume,
+                state_lock=_STOP_LOCK,
+                state_write_allowed=is_current_worker,
+                verification_attempt_limit=(
+                    lambda: _verification_settings(workdir)["max_attempts"]
+                ),
+                pending_problem_text=task,
+                pending_upload_paths=tuple(saved),
+                on_ingested=on_ingested,
+            )
+            if pending_answer is not None:
+                result = dict(pending_answer.get("result") or {})
+                change_request_id = pending_answer.get("change_request_id")
+                if change_request_id:
+                    resolved = resolve_change_request(
+                        workdir,
+                        str(change_request_id),
+                        action=str(result.get("change_action") or "adjust"),
+                        answer=str(result.get("answer") or ""),
+                        selected_option_id=result.get("option_id"),
+                        usage_baseline_cny=agent.total_usage.estimated_cost_cny,
+                    )
+                    result["revision_id"] = resolved.get("revision_id")
+                    if result["revision_id"]:
+                        update_active_revision_status(workdir, "running")
+                observation = "[ask_user_result] " + json.dumps(
+                    result,
+                    ensure_ascii=False,
                 )
-                agent = build_agent(
-                    run_cfg,
-                    workdir,
-                    max_steps=_agent_settings(workdir)["max_steps"],
-                    sub_max_steps=_subagent_settings(workdir)["max_steps"],
-                    on_event=on_event,
-                    stop_event=stop_event,
-                    resume=resume and not switched_to_modeling,
-                    state_lock=_STOP_LOCK,
-                    state_write_allowed=is_current_worker,
-                    verification_attempt_limit=(
-                        lambda: _verification_settings(workdir)["max_attempts"]
-                    ),
+                agent.resume_tool_result(
+                    str(pending_answer["tool_call_id"]),
+                    observation,
                 )
-                # Keep dashboard/runtime instructions in the Agent's system
-                # prompt. The task event and persisted user message must contain
-                # only what the user actually submitted.
-                full = task or "Solve the modeling problem."
+                on_event(
+                    "ask_resolved",
+                    {
+                        "id": pending_answer["id"],
+                        "answered": True,
+                        "selected_option_id": result.get("option_id"),
+                        "change_action": result.get("change_action"),
+                        "revision_id": result.get("revision_id"),
+                    },
+                )
+                from ..tools.ask_user import complete_claimed_answer
+                complete_claimed_answer(workdir)
+            # Keep dashboard/runtime instructions in the Agent's system prompt.
+            # The persisted user message remains exactly what the user typed.
+            full = None if pending_answer is not None else task
+            attachment_instruction = None
+            if saved:
+                attachment_names = ", ".join(path.name for path in saved)
+                attachment_instruction = (
+                    "[Current-turn attachment metadata — this is not user-authored "
+                    "text]\n"
+                    f"The user attached: {attachment_names}. The raw uploads are "
+                    "held by the backend. If the request requires inspecting or "
+                    "using them, call ingest_problem; do not claim to have read "
+                    "them before that tool succeeds."
+                )
             agent.run(
                 full,
                 verify_on_completion=(
-                    mode == "modeling"
-                    and (not resume or switched_to_modeling)
+                    modeling_was_active and internal_instruction
                 ),
+                internal_instruction=internal_instruction,
+                turn_system_instruction=attachment_instruction,
             )
             # Precise, not inferred: max_steps must show as "stopped", not "done".
             terminal_status = {
                 "done": "done", "cancelled": "cancelled", "max_steps": "stopped",
                 "verification_failed": "stopped",
+                "budget_exhausted": "stopped",
+                "waiting_input": "waiting_input",
             }.get(agent.last_stop_reason, "done")
-            finish_if_current(terminal_status)
+            finish_if_current(
+                terminal_status,
+                stop_reason=agent.last_stop_reason,
+            )
         except Exception as exc:
             with _STOP_LOCK:
-                if is_current_worker():
+                owns_run = is_current_worker()
+                if owns_run:
                     (workdir / "error.log").write_text(traceback.format_exc())
-                    finish_if_current(
-                        "error",
-                        failure_reason=f"运行异常：{type(exc).__name__}: {exc}",
-                    )
+            if owns_run:
+                finish_if_current(
+                    "error",
+                    failure_reason=f"运行异常：{type(exc).__name__}: {exc}",
+                )
         finally:
             with _STOP_LOCK:
                 if is_current_worker():
@@ -1091,6 +1441,82 @@ def continue_task(run_id: str, task: str, files: list[dict]) -> tuple[str, str]:
     return run_id, meta.get("name") or run_id
 
 
+def continue_after_max_steps(run_id: str) -> dict:
+    """Extend a max-step-stopped modeling run by exactly 40 steps and resume it.
+
+    The persisted conversation limit grows by 40 so Settings reflects the new
+    ceiling. This continuation itself receives only those 40 additional steps,
+    rather than accidentally starting a fresh full-size step budget.
+    """
+    from ..agent.build import session_state_path
+
+    workdir = _run_dir(run_id)
+    if not workdir.is_dir():
+        raise ValueError("run not found")
+
+    with _STOP_LOCK:
+        if _run_status(workdir) != "stopped":
+            raise RunStateError("只有达到最大步数而暂停的会话才能直接继续。")
+        meta = _meta(workdir)
+        stop_reason = meta.get("stop_reason") or _last_lead_stop_reason(workdir)
+        if stop_reason != "max_steps":
+            raise RunStateError("这次会话并非因达到最大步数而暂停，请在输入框中继续。")
+        if str(meta.get("mode") or "modeling") != "modeling":
+            raise RunStateError("只有建模会话支持增加主 Agent 步数后直接继续。")
+        if not session_state_path(workdir).is_file():
+            raise RunStateError("这次会话缺少可续接的历史状态。")
+
+        current = _agent_settings(workdir)["max_steps"]
+        extended = current + _MAIN_AGENT_STEPS_EXTENSION
+        if extended > _MAIN_AGENT_STEPS_MAX:
+            raise RunStateError(
+                f"主 Agent 最大步数不能超过 {_MAIN_AGENT_STEPS_MAX}；"
+                "请先在设置中调整当前配置。"
+            )
+
+        had_custom_value = "main_agent_max_steps" in meta
+        prior_custom_value = meta.get("main_agent_max_steps")
+        with _META_LOCK:
+            meta = _meta(workdir)
+            meta["main_agent_max_steps"] = extended
+            _write_meta(workdir, meta)
+
+        instruction = (
+            "[Orchestrator continuation — this is not user input]\n"
+            "The previous run reached its main-Agent step limit before the "
+            f"task was complete. Continue from the persisted state with the {_MAIN_AGENT_STEPS_EXTENSION} "
+            "newly granted steps. Do not restart completed work; finish the "
+            "remaining plan, verification, and delivery work."
+        )
+        try:
+            _start_agent_thread(
+                run_id,
+                workdir,
+                instruction,
+                [],
+                resume=True,
+                max_steps_override=_MAIN_AGENT_STEPS_EXTENSION,
+                internal_instruction=True,
+            )
+        except Exception:
+            # Keep the setting change and the new worker generation atomic.
+            with _META_LOCK:
+                rollback = _meta(workdir)
+                if had_custom_value:
+                    rollback["main_agent_max_steps"] = prior_custom_value
+                else:
+                    rollback.pop("main_agent_max_steps", None)
+                _write_meta(workdir, rollback)
+            raise
+
+    return {
+        "id": run_id,
+        "name": meta.get("name") or run_id,
+        "added_steps": _MAIN_AGENT_STEPS_EXTENSION,
+        "agent_settings": _agent_settings(workdir),
+    }
+
+
 def stop_run(run_id: str) -> None:
     """Immediately invalidate the current generation and make it continuable.
 
@@ -1101,26 +1527,39 @@ def stop_run(run_id: str) -> None:
     soon as this function returns.
     """
     d = _run_dir(run_id)
+    missing_worker_reason: str | None = None
     with _STOP_LOCK:
         status = _run_status(d)
         if status not in {"running", "waiting_input"}:
             raise RunStateError("会话当前不是运行状态，无法停止。")
         ev = _STOP_EVENTS.get(run_id)
-        if ev is None:
+        if ev is None and status == "waiting_input":
+            # Durable questions intentionally have no live worker: the Agent
+            # checkpointed its open tool call and released the thread.
+            (d / "pending_question.json").unlink(missing_ok=True)
+            (d / "answered_question.json").unlink(missing_ok=True)
+            _set_status(d, "cancelled", stop_reason="cancelled")
+        elif ev is None:
             # A running status without a lease means the process lost the
             # worker (normally because the service was restarted).
             reason = "会话线程已不存在（可能是服务重启导致），已自动标记为异常。请重新开始本次会话。"
             (d / "pending_question.json").unlink(missing_ok=True)
             _set_status(d, "error", failure_reason=reason)
-            raise RunStateError(reason)
-
-        ev.set()
-        # Removing this exact event is the generation cut-off. Old worker
-        # callbacks and state saves now fail their lease checks immediately.
-        if _STOP_EVENTS.get(run_id) is ev:
-            _STOP_EVENTS.pop(run_id, None)
-        (d / "pending_question.json").unlink(missing_ok=True)
-        _set_status(d, "cancelled")
+            missing_worker_reason = reason
+        else:
+            ev.set()
+            # Removing this exact event is the generation cut-off. Old worker
+            # callbacks and state saves now fail their lease checks immediately.
+            if _STOP_EVENTS.get(run_id) is ev:
+                _STOP_EVENTS.pop(run_id, None)
+            (d / "pending_question.json").unlink(missing_ok=True)
+            _set_status(d, "cancelled", stop_reason="cancelled")
+    # Do not merely rely on the sandbox poller: if that worker thread also
+    # failed, the durable ownership labels still let us terminate its exact
+    # containers without touching another conversation.
+    cleanup_managed_containers(d)
+    if missing_worker_reason:
+        raise RunStateError(missing_worker_reason)
 
 
 def answer_question(
@@ -1129,24 +1568,44 @@ def answer_question(
     answer: str | None = None,
     option_id: str | None = None,
 ) -> None:
-    """Deliver a user's response to a run currently blocked in ask_user."""
-    from ..tools.ask_user import submit_answer
+    """Resolve a durable question and resume its exact open tool call."""
+    from ..agent.build import session_state_path
+    from ..tools.ask_user import claim_pending_answer, restore_claimed_answer
 
     d = _run_dir(run_id)
-    pq = d / "pending_question.json"
-    if not pq.is_file():
-        raise RunStateError("当前没有等待回答的问题（可能已经回答或会话已停止）。")
-    try:
-        question_id = json.loads(pq.read_text())["id"]
-    except (json.JSONDecodeError, KeyError):
-        raise RunStateError("无法读取待回答的问题。")
-    if not submit_answer(
-        run_id,
-        question_id,
-        answer=answer,
-        option_id=option_id,
-    ):
-        raise RunStateError("这个问题已经不再等待回答。")
+    with _STOP_LOCK:
+        if _run_status(d) != "waiting_input":
+            raise RunStateError("当前没有等待回答的问题（可能已经回答或会话已停止）。")
+        if not session_state_path(d).is_file():
+            raise RunStateError("待回答问题缺少可恢复的 Agent 检查点。")
+        pq = d / "pending_question.json"
+        try:
+            question_id = json.loads(pq.read_text())["id"]
+        except (OSError, json.JSONDecodeError, KeyError):
+            raise RunStateError("无法读取待回答的问题。")
+        try:
+            claimed = claim_pending_answer(
+                d,
+                question_id,
+                answer=answer,
+                option_id=option_id,
+            )
+        except ValueError as exc:
+            raise RunStateError(str(exc)) from exc
+        try:
+            _start_agent_thread(
+                run_id,
+                d,
+                "",
+                [],
+                resume=True,
+                internal_instruction=True,
+                pending_answer=claimed,
+            )
+        except Exception:
+            restore_claimed_answer(d, claimed)
+            _set_status(d, "waiting_input")
+            raise
 
 
 def update_verification_prompt(run_id: str, prompt: str | None) -> dict:
@@ -1266,9 +1725,19 @@ def update_subagent_settings(
     return _subagent_settings(workdir)
 
 
+def update_project_budget_settings(run_id: str, value: object) -> dict:
+    """Persist the authoritative per-revision cost cap for a project."""
+    workdir = _run_dir(run_id)
+    if not workdir.is_dir():
+        raise ValueError("run not found")
+    return update_project_budget_limit(workdir, value)  # type: ignore[arg-type]
+
+
 def update_provider_settings(body: dict) -> dict:
-    """Persist the global provider used by conversations started afterwards."""
+    """Persist the local global provider or this public account's provider."""
     with _PROVIDER_SETTINGS_LOCK:
+        if _PUBLIC_DEPLOYMENT and _AUTH_PROFILE_URL:
+            return save_user_provider_settings(body, _CFG, _workspace())
         return save_provider_settings(
             provider=str(body.get("provider", "")),
             model=str(body.get("model", "")),
@@ -1277,16 +1746,30 @@ def update_provider_settings(body: dict) -> dict:
                 str(body["api_key"])
                 if body.get("api_key") is not None else None
             ),
+            reasoning_effort=(
+                str(body["reasoning_effort"])
+                if body.get("reasoning_effort") is not None else None
+            ),
             current_cfg=_CFG,
         )
 
 
-def _set_status(workdir: Path, status: str, failure_reason: str | None = None) -> None:
+def _set_status(
+    workdir: Path,
+    status: str,
+    failure_reason: str | None = None,
+    *,
+    stop_reason: str | None = None,
+    sync_project: bool = True,
+) -> None:
     with _META_LOCK:
         m = _meta(workdir)
         m["status"] = status
         if status == "running":
             m["last_activity"] = time.time()
+            m.pop("stop_reason", None)
+        elif stop_reason:
+            m["stop_reason"] = stop_reason
         if failure_reason:
             m["failure_reason"] = failure_reason
             m["failed_at"] = time.time()
@@ -1294,6 +1777,8 @@ def _set_status(workdir: Path, status: str, failure_reason: str | None = None) -
             m.pop("failure_reason", None)
             m.pop("failed_at", None)
         _write_meta(workdir, m)
+    if sync_project:
+        update_active_revision_status(workdir, status)
 
 
 def retry_task(run_id: str) -> tuple[str, str]:
@@ -1330,7 +1815,7 @@ def retry_task(run_id: str) -> tuple[str, str]:
 def delete_run(run_id: str) -> None:
     """Permanently remove one completed or empty conversation workspace."""
     workdir = _run_dir(run_id)
-    workspace_root = WORKSPACE.resolve()
+    workspace_root = _workspace().resolve()
     if workdir == workspace_root or not workdir.is_dir():
         raise ValueError("run not found")
     with _META_LOCK:
@@ -1354,6 +1839,45 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json(self, obj) -> None:
         self._send(200, json.dumps(obj, ensure_ascii=False, default=str).encode(), "application/json; charset=utf-8")
+
+    def _authenticate_api_request(self) -> None:
+        """Validate the existing site JWT and bind this request to one user."""
+        if not _AUTH_PROFILE_URL:
+            return
+        authorization = self.headers.get("Authorization", "").strip()
+        if not authorization.lower().startswith("bearer "):
+            raise AuthenticationError("authentication required")
+        profile_request = Request(
+            _AUTH_PROFILE_URL,
+            headers={"Authorization": authorization, "Accept": "application/json"},
+        )
+        try:
+            with urlopen(profile_request, timeout=10) as response:
+                payload = json.loads(response.read())
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise AuthenticationError("invalid or expired account token") from exc
+        user = payload.get("data") if isinstance(payload, dict) else None
+        user_id = user.get("id") if isinstance(user, dict) else None
+        if user_id is None:
+            # Some existing account-validation endpoints intentionally return
+            # only balance metadata. Their successful 2xx response has already
+            # verified the JWT and user; recover the signed subject only after
+            # that validation instead of trusting an unverified bearer token.
+            try:
+                token = authorization.split(None, 1)[1]
+                encoded_payload = token.split(".")[1]
+                encoded_payload += "=" * (-len(encoded_payload) % 4)
+                claims = json.loads(base64.urlsafe_b64decode(encoded_payload))
+                user_id = claims.get("sub")
+            except (IndexError, TypeError, ValueError, json.JSONDecodeError):
+                user_id = None
+        if user_id is None:
+            raise AuthenticationError("invalid account profile")
+        _REQUEST_SCOPE.user_id = str(user_id)
+
+    def _clear_request_scope(self) -> None:
+        if hasattr(_REQUEST_SCOPE, "user_id"):
+            del _REQUEST_SCOPE.user_id
 
     def _serve_spa(self, request_path: str) -> None:
         """Serve a Vite build asset, falling back to the SPA entry point."""
@@ -1379,11 +1903,16 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         try:
+            if u.path == "/health":
+                self._json({"ok": True})
+                return
+            if u.path.startswith("/api/"):
+                self._authenticate_api_request()
             if u.path == "/api/runs":
                 self._json(list_runs())
             elif u.path == "/api/provider-settings":
                 with _PROVIDER_SETTINGS_LOCK:
-                    self._json(provider_settings_payload(_CFG))
+                    self._json(_provider_settings_payload())
             elif u.path == "/api/run":
                 self._json(run_detail(q.get("id", [""])[0]))
             elif u.path == "/api/file":
@@ -1398,11 +1927,16 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(404, b"not found", "text/plain")
         except Exception as e:
-            self._send(500, str(e).encode(), "text/plain")
+            code = 401 if isinstance(e, AuthenticationError) else 500
+            self._send(code, json.dumps({"error": str(e)}).encode(), "application/json")
+        finally:
+            self._clear_request_scope()
 
     def do_POST(self):
         u = urlparse(self.path)
         try:
+            if u.path.startswith("/api/"):
+                self._authenticate_api_request()
             if u.path == "/api/drafts":
                 run_id, name = create_draft()
                 self._json({"id": run_id, "name": name})
@@ -1426,6 +1960,10 @@ class Handler(BaseHTTPRequestHandler):
                     str(body.get("id", "")), (body.get("task") or "").strip(), body.get("files") or [],
                 )
                 self._json({"id": run_id, "name": name})
+            elif u.path == "/api/continue-after-max-steps":
+                n = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(n) or b"{}")
+                self._json(continue_after_max_steps(str(body.get("id", ""))))
             elif u.path == "/api/retry":
                 n = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(n) or b"{}")
@@ -1481,52 +2019,116 @@ class Handler(BaseHTTPRequestHandler):
                 run_id = str(body.get("id", ""))
                 max_steps = None if body.get("reset") else body.get("max_steps")
                 self._json(update_subagent_settings(run_id, max_steps))
+            elif u.path == "/api/project-budget-settings":
+                n = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(n) or b"{}")
+                self._json(update_project_budget_settings(
+                    str(body.get("id", "")),
+                    body.get("revision_budget_limit_cny"),
+                ))
             else:
                 self._send(404, b"not found", "text/plain")
         except Exception as e:
-            code = 409 if isinstance(e, RunStateError) else 400 if isinstance(e, ValueError) else 500
+            code = 401 if isinstance(e, AuthenticationError) else 409 if isinstance(e, RunStateError) else 400 if isinstance(e, ValueError) else 500
             self._send(code, json.dumps({"error": str(e)}).encode(), "application/json")
+        finally:
+            self._clear_request_scope()
 
     def do_DELETE(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         try:
+            if u.path.startswith("/api/"):
+                self._authenticate_api_request()
             if u.path == "/api/run":
                 delete_run(q.get("id", [""])[0])
                 self._json({"ok": True})
             else:
                 self._send(404, b"not found", "text/plain")
         except Exception as e:
-            code = 409 if isinstance(e, RunStateError) else 500
+            code = 401 if isinstance(e, AuthenticationError) else 409 if isinstance(e, RunStateError) else 500
             self._send(code, json.dumps({"error": str(e)}).encode(), "application/json")
+        finally:
+            self._clear_request_scope()
 
 
-def _reconcile_orphaned_runs() -> None:
-    """Called once at startup: no thread from a previous process can possibly
-    still be alive, so any run left "running"/"waiting_input" in meta.json is
-    a zombie from the last time this process was stopped or restarted (e.g. to
-    pick up a code change) mid-run. Mark it errored immediately instead of
-    leaving it stuck showing "running" forever -- with no registered
-    _STOP_EVENTS entry, stop_run() could never do anything for it anyway.
+def _reconcile_orphaned_runs(
+    cleanup_containers=cleanup_managed_containers,
+) -> None:
+    """Reconcile lost workers while preserving durable human checkpoints.
+
+    A running worker cannot survive a process restart and becomes an error. A
+    waiting_input run is different: it intentionally has no worker and remains
+    answerable when both its question and open tool call exist on disk.
     """
-    if not WORKSPACE.is_dir():
-        return
     reason = "服务重启导致本次会话中断，未能继续运行。请重新开始本次会话。"
-    for d in WORKSPACE.iterdir():
-        if not d.is_dir():
-            continue
-        if _meta(d).get("status") in {"running", "waiting_input"}:
-            (d / "pending_question.json").unlink(missing_ok=True)
-            _set_status(d, "error", failure_reason=reason)
+    roots = [WORKSPACE]
+    users_root = WORKSPACE / ".users"
+    if users_root.is_dir():
+        roots.extend(d for d in users_root.iterdir() if d.is_dir())
+    run_dirs = [
+        d
+        for root in roots
+        if root.is_dir()
+        for d in root.iterdir()
+        if d.is_dir() and d.name != ".users"
+    ]
+    for d in run_dirs:
+        status = _meta(d).get("status")
+        if status in {"running", "waiting_input"}:
+            try:
+                cleanup = cleanup_containers(d)
+            except Exception as exc:
+                # Docker cleanup is best-effort and must never prevent the
+                # dashboard itself from starting or the zombie status from
+                # being reconciled.
+                cleanup = ContainerCleanupResult(error=str(exc))
+            resumable_question = (
+                status == "waiting_input" and _durable_question_is_resumable(d)
+            )
+            if not resumable_question:
+                (d / "pending_question.json").unlink(missing_ok=True)
+                _set_status(d, "error", failure_reason=reason)
+            with _META_LOCK:
+                meta = _meta(d)
+                meta["orphan_container_cleanup"] = {
+                    "attempted_at": time.time(),
+                    "matched": list(cleanup.matched),
+                    "removed": list(cleanup.removed),
+                    "error": cleanup.error,
+                }
+                _write_meta(d, meta)
+
+
+def _durable_question_is_resumable(workdir: Path) -> bool:
+    try:
+        question = json.loads((workdir / "pending_question.json").read_text())
+        tool_call_id = str(question["tool_call_id"])
+        if not question.get("id") or not tool_call_id:
+            return False
+        state = json.loads((workdir / "session_state.json").read_text())
+        open_ids: set[str] = set()
+        for message in state.get("messages", []):
+            if message.get("role") == "assistant":
+                for call in message.get("tool_calls") or []:
+                    call_id = str(call.get("id") or "")
+                    if call_id:
+                        open_ids.add(call_id)
+            elif message.get("role") == "tool":
+                open_ids.discard(str(message.get("tool_call_id") or ""))
+        return tool_call_id in open_ids
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        return False
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
     args = ap.parse_args()
     _reconcile_orphaned_runs()
-    srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"mathmodel dashboard -> http://127.0.0.1:{args.port}")
+    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f"mathmodel dashboard -> http://{args.host}:{args.port}")
     print(f"serving + launching runs in {WORKSPACE}")
     try:
         srv.serve_forever()

@@ -623,6 +623,10 @@ def check_retry_limit_delivers_after_final_repair(workdir: Path) -> None:
 
 def build_valid_artifacts(workdir: Path) -> None:
     (workdir / "problem.md").write_text("A complete modeling problem.")
+    (workdir / "src").mkdir(exist_ok=True)
+    (workdir / "src" / "model.py").write_text(
+        "def solve():\n    return 42\n"
+    )
     (workdir / "results").mkdir(exist_ok=True)
     (workdir / "results" / "answer.json").write_text(json.dumps({"value": 42}))
     (workdir / "logs").mkdir(exist_ok=True)
@@ -652,9 +656,13 @@ def build_valid_artifacts(workdir: Path) -> None:
         page.insert_text((50, 80), f"Substantive paper content page {page_number}")
     pdf.save(workdir / "paper" / "main.pdf")
     pdf.close()
+    # Process history may exist in the lead workspace, but it is deliberately
+    # excluded from the independent verifier bundle.
     (workdir / "plan.json").write_text(json.dumps({
         "tasks": [{"id": "q1", "title": "solve", "status": "done"}],
     }))
+    (workdir / "plan.md").write_text("# Plan\n- done")
+    (workdir / "decisions.md").write_text("# Decisions\n- internal rationale")
 
 
 def check_preflight(workdir: Path) -> None:
@@ -715,11 +723,9 @@ def check_preflight(workdir: Path) -> None:
         "\\begin{abstract}摘要太短。\\end{abstract}\n\\clearpage\n"
         "\\section{Final model}\n\\[x=1\\]\n\\end{document}\n"
     )
-    (workdir / "logs" / "run_1.log").write_text(
-        "=== source ===\n"
+    (workdir / "src" / "model.py").write_text(
         "import matplotlib.pyplot as plt\n"
         "plt.xlabel('时间')\n"
-        "--- exit_code=0 timed_out=False stopped=False ---"
     )
     quality_issues = _preflight(workdir)
     quality_categories = {item.category for item in quality_issues}
@@ -727,13 +733,9 @@ def check_preflight(workdir: Path) -> None:
         "paper-length", "abstract-content", "model-formulation", "figure-language",
     } <= quality_categories
 
-    (workdir / "plan.json").write_text(json.dumps({
-        "tasks": [{"id": "q1", "title": "solve", "status": "pending"}],
-    }))
     (workdir / "paper" / "main.tex").write_text(r"\section{2.5 2.5 Final model}")
     issues = _preflight(workdir)
     categories = {item.category for item in issues}
-    assert "coverage" in categories
     assert "paper-format" in categories
 
     (workdir / "paper" / "main.tex").write_text(
@@ -1013,6 +1015,43 @@ def check_verifier_deadline_fallback(workdir: Path) -> None:
     assert "max_steps" not in phases
 
 
+def check_final_artifact_bundle(workdir: Path) -> None:
+    build_valid_artifacts(workdir)
+    (workdir / "paper" / "revisions").mkdir()
+    (workdir / "paper" / "revisions" / "old.tex").write_text("stale")
+    destination = workdir.parent / f"{workdir.name}-bundle"
+    destination.mkdir()
+
+    verifier_module._copy_artifacts(workdir, destination)
+
+    assert (destination / "src" / "model.py").is_file()
+    assert not (destination / "logs").exists()
+    assert not (destination / "plan.json").exists()
+    assert not (destination / "plan.md").exists()
+    assert not (destination / "decisions.md").exists()
+    assert not (destination / "paper" / "revisions").exists()
+
+    manifest = json.loads(
+        (destination / "artifact_manifest.json").read_text()
+    )
+    by_path = {item["path"]: item for item in manifest["artifacts"]}
+    assert manifest["schema_version"] == 1
+    assert by_path["src/model.py"]["role"] == "final_source"
+    assert by_path["src/model.py"]["line_count"] == 2
+    assert by_path["src/model.py"]["symbols"] == [
+        {"kind": "function", "name": "solve", "line": 1}
+    ]
+    assert by_path["paper/main.tex"]["role"] == "paper_source"
+    assert "logs/run_1.log" not in by_path
+    assert "plan.json" not in by_path
+
+    tool_names = [
+        item["function"]["name"]
+        for item in verifier_module._inspection_registry().schemas()
+    ]
+    assert tool_names == ["read_file", "results_list", "results_get", "run_code"]
+
+
 def check_isolated_scope_recovery(workdir: Path) -> None:
     build_valid_artifacts(workdir)
     provider = IsolatedRecoveryProvider(recover=True)
@@ -1180,7 +1219,12 @@ def main() -> None:
         preflight = root / "preflight"
         preflight.mkdir()
         check_preflight(preflight)
-        print("[7] deterministic artifact, plan, and LaTeX checks enforced")
+        print("[7] deterministic final-source, result, and LaTeX checks enforced")
+
+        artifact_bundle = root / "artifact-bundle"
+        artifact_bundle.mkdir()
+        check_final_artifact_bundle(artifact_bundle)
+        print("[7b] verifier bundle contains final artifacts only with a manifest")
 
         preflight_block = root / "preflight-block"
         preflight_block.mkdir()

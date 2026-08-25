@@ -15,6 +15,8 @@
 
 将整个文件夹作为一个 Skill 加载，核心指令位于 `SKILL.md`。
 
+加载后会激活美赛论文页数档案：官方上限 25 页，写作目标 25 页，24–25 页可以验收。
+
 可使用的辅助模板：
 
 - `templates/summary-sheet-template.md`

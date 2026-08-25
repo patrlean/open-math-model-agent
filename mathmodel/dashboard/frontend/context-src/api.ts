@@ -2,6 +2,7 @@ import type {
   ContextRequestDetail,
   ContextRequestSummary,
   ContextRun,
+  ToolMetrics,
 } from './types'
 
 async function requestJson<T>(path: string, signal?: AbortSignal): Promise<T> {
@@ -34,6 +35,13 @@ export function fetchRequestDetail(
 ) {
   return requestJson<ContextRequestDetail>(
     `/api/request?run_id=${encodeURIComponent(runId)}&request_id=${encodeURIComponent(requestId)}`,
+    signal,
+  )
+}
+
+export function fetchToolMetrics(runId: string, signal?: AbortSignal) {
+  return requestJson<ToolMetrics>(
+    `/api/tool-metrics?run_id=${encodeURIComponent(runId)}`,
     signal,
   )
 }

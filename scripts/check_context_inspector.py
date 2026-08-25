@@ -9,13 +9,19 @@ from pathlib import Path
 from mathmodel.agent.loop import Agent
 from mathmodel.context_inspector import server as inspector_server
 from mathmodel.contextlog import (
+    CONTEXT_INDEX_FILENAME,
     ContextRecorder,
+    build_context_index,
     classify_request,
+    context_log_stats,
+    read_context_request,
+    read_context_request_summaries,
     read_context_requests,
     request_detail,
 )
 from mathmodel.providers.base import ChatResponse, Provider, ToolCall, Usage
 from mathmodel.tools.base import Tool, ToolContext, ToolRegistry
+from mathmodel.tool_metrics import conversation_tool_metrics
 
 
 class InstrumentedFakeProvider(Provider):
@@ -116,6 +122,58 @@ def main() -> None:
         assert records[0]["context"]["agent_role"] == "Main Agent"
         assert records[0]["context"]["system_prompt_source"] == "agent.md"
 
+        index_path = run / CONTEXT_INDEX_FILENAME
+        assert index_path.is_file()
+        indexed_summaries = read_context_request_summaries(
+            run / "context_requests.jsonl"
+        )
+        assert [item["sequence"] for item in indexed_summaries] == [1, 2]
+        assert indexed_summaries[1]["status"] == "completed"
+        indexed_record = read_context_request(
+            run / "context_requests.jsonl",
+            records[1]["request_id"],
+        )
+        assert indexed_record is not None
+        assert indexed_record["params"] == records[1]["params"]
+        assert context_log_stats(run / "context_requests.jsonl") == {
+            "request_count": 2,
+            "latest_request_ts": records[1]["ts"],
+            "latest_model": "fake-context-model",
+        }
+
+        # Legacy logs self-migrate once, then serve summaries and details from
+        # compact index records plus direct byte-offset reads.
+        index_path.unlink()
+        assert build_context_index(
+            run / "context_requests.jsonl"
+        ) == index_path
+        assert [
+            item["sequence"]
+            for item in read_context_request_summaries(
+                run / "context_requests.jsonl"
+            )
+        ] == [1, 2]
+
+        # A reader can race a recorder in another process. An incomplete tail
+        # must remain pending and become indexable once its newline arrives.
+        partial_log = workspace / "partial-context.jsonl"
+        partial_record = json.dumps({
+            "kind": "request",
+            "request_id": "partial-request",
+            "sequence": 1,
+            "ts": 123.0,
+            "params": {"model": "partial-model", "messages": []},
+            "context": {},
+        }).encode("utf-8")
+        split_at = len(partial_record) // 2
+        partial_log.write_bytes(partial_record[:split_at])
+        assert read_context_request_summaries(partial_log) == []
+        with partial_log.open("ab") as handle:
+            handle.write(partial_record[split_at:] + b"\n")
+        partial_summaries = read_context_request_summaries(partial_log)
+        assert len(partial_summaries) == 1
+        assert partial_summaries[0]["request_id"] == "partial-request"
+
         first_items = classify_request(records[0])
         first_categories = {item["category"] for item in first_items}
         assert {
@@ -173,8 +231,48 @@ def main() -> None:
             assert listed[0]["request_count"] == 2
             summaries = inspector_server.list_run_requests("test-run")
             assert [item["sequence"] for item in summaries] == [2, 1]
-            served = inspector_server.get_request("test-run", records[1]["request_id"])
+            served = inspector_server.get_request(
+                "test-run",
+                records[1]["request_id"],
+            )
             assert served["items"] == second["items"]
+
+            # Tool metrics use the unique event stream, not cumulative API
+            # contexts. Exercise main/sub-agent/verifier classification and the
+            # specialized LaTeX/verdict outcomes deterministically.
+            metric_events = [
+                {"kind": "assistant", "tool_calls": [["run_code", "{}"]]},
+                {"kind": "tool_result", "name": "run_code", "observation": "exit_code=1 timed_out=False"},
+                {"kind": "assistant", "tool_calls": [["run_code", "{}"]]},
+                {"kind": "tool_result", "name": "run_code", "observation": "exit_code=0 timed_out=False"},
+                {"kind": "assistant", "subagent": 1, "tool_calls": [["edit_paragraph", "{}"]]},
+                {"kind": "tool_result", "subagent": 1, "name": "edit_paragraph", "observation": "localized edit compiled and paper acceptance PASSED -> paper/main.pdf"},
+                {"kind": "verification_progress", "phase": "assistant", "role": "verifier", "attempt": 1, "tool_calls": [["submit_verification", "{}"]]},
+                {"kind": "verification_progress", "phase": "tool_result", "role": "verifier", "attempt": 1, "name": "submit_verification", "observation": "Verification verdict recorded."},
+                {"kind": "assistant", "tool_calls": [["read_file", "{}"]]},
+            ]
+            events_path = run / "events.jsonl"
+            events_path.write_text("".join(
+                json.dumps(event) + "\n" for event in metric_events
+            ))
+            metrics = inspector_server.get_tool_metrics("test-run")
+            assert metrics == conversation_tool_metrics(
+                events_path,
+                run_status="done",
+            )
+            overall = metrics["groups"]["all"]["summary"]
+            assert overall["total_calls"] == 5
+            assert overall["completed_calls"] == 4
+            assert overall["interrupted_calls"] == 1
+            assert overall["objective_successes"] == 3
+            assert overall["compile_successes"] == 1
+            assert overall["acceptance_successes"] == 1
+            assert overall["verdict_successes"] == 1
+            assert overall["retry_attempts"] == 1
+            assert overall["recovered_retries"] == 1
+            assert metrics["groups"]["main"]["summary"]["total_calls"] == 3
+            assert metrics["groups"]["subagent"]["summary"]["total_calls"] == 1
+            assert metrics["groups"]["verifier"]["summary"]["total_calls"] == 1
         finally:
             inspector_server.WORKSPACE = original_workspace
 

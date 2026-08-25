@@ -8,12 +8,14 @@ no network by default) keep runaway code contained.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import signal
 import subprocess
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 from .base import DEFAULT_EXEC_TIMEOUT_SECONDS, ExecResult, Sandbox
@@ -22,6 +24,81 @@ DEFAULT_IMAGE = "mathmodel-sandbox:latest"
 # How often to check the timeout/stop_event while the container runs. This
 # bounds how long a stop click can be stuck behind a long-running computation.
 _POLL_INTERVAL = 0.25
+_MANAGED_LABEL = "com.mathmodel.managed"
+_WORKDIR_LABEL = "com.mathmodel.workdir-sha256"
+
+
+@dataclass(frozen=True)
+class ContainerCleanupResult:
+    """Result of a narrowly-scoped orphan-container cleanup attempt."""
+
+    matched: tuple[str, ...] = ()
+    removed: tuple[str, ...] = ()
+    error: str | None = None
+
+
+def workdir_fingerprint(workdir: str | Path) -> str:
+    """Return a stable, label-safe identity for one host workspace path."""
+    resolved = str(Path(workdir).expanduser().resolve())
+    return hashlib.sha256(resolved.encode("utf-8")).hexdigest()
+
+
+def managed_container_labels(workdir: str | Path) -> dict[str, str]:
+    """Labels shared by every run_code container for one conversation."""
+    return {
+        _MANAGED_LABEL: "true",
+        _WORKDIR_LABEL: workdir_fingerprint(workdir),
+    }
+
+
+def cleanup_managed_containers(workdir: str | Path) -> ContainerCleanupResult:
+    """Remove only run_code containers created for ``workdir``.
+
+    Container names are intentionally not used as the ownership boundary: a
+    prefix match could remove an unrelated benchmark or another conversation.
+    Both the application-managed marker and the exact resolved-workdir hash
+    must match before any container ID is passed to ``docker rm -f``.
+    """
+    labels = managed_container_labels(workdir)
+    list_cmd = ["docker", "ps", "-aq"]
+    for key, value in labels.items():
+        list_cmd.extend(["--filter", f"label={key}={value}"])
+    try:
+        listed = subprocess.run(
+            list_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        return ContainerCleanupResult(error=str(exc))
+    if listed.returncode != 0:
+        detail = (listed.stderr or "docker ps failed").strip()
+        return ContainerCleanupResult(error=detail[:1000])
+
+    matched = tuple(
+        line.strip() for line in (listed.stdout or "").splitlines() if line.strip()
+    )
+    if not matched:
+        return ContainerCleanupResult()
+
+    try:
+        removed = subprocess.run(
+            ["docker", "rm", "-f", *matched],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        return ContainerCleanupResult(matched=matched, error=str(exc))
+    if removed.returncode != 0:
+        detail = (removed.stderr or "docker rm -f failed").strip()
+        return ContainerCleanupResult(matched=matched, error=detail[:1000])
+    return ContainerCleanupResult(matched=matched, removed=matched)
 
 
 class DockerSandbox(Sandbox):
@@ -58,9 +135,12 @@ class DockerSandbox(Sandbox):
         # PDF, revisions, and acceptance metrics stay synchronized.
         paper_dir = self.workdir / "paper"
         paper_dir.mkdir(exist_ok=True)
+        labels = managed_container_labels(self.workdir)
 
         cmd = [
             "docker", "run", "--rm", "--name", container_name,
+            "--label", f"{_MANAGED_LABEL}={labels[_MANAGED_LABEL]}",
+            "--label", f"{_WORKDIR_LABEL}={labels[_WORKDIR_LABEL]}",
             "--network", self.network,
             "--memory", self.mem_limit,
             "-v", f"{self.workdir}:/work",

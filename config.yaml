@@ -2,26 +2,67 @@
 # Secrets (API keys) live in .env, not here.
 
 provider: deepseek
-model: deepseek-v4-pro          # verified via scripts/check_provider.py (also: deepseek-v4-flash)
+model: deepseek-v4-flash        # default; switch models beside the composer send button
 base_url: https://api.deepseek.com
+reasoning_effort: high       # low / high / max; DeepSeek defaults to high
 
 context:
   compact_threshold_tokens: 1000000   # compact when the CURRENT context window (last prompt_tokens) reaches this; must be < model max context
+  keep_tail_messages: 12              # legacy default; context experiments may override this per submission
+  compaction_strategy: legacy_monolithic  # preserves the original implementation unless an experiment opts in
+  tool_result_externalize_threshold_tokens: 1000
+  tool_result_preview_chars: 600
+  tool_prune_threshold_tokens: 650000       # used only by policy-pruning v2 strategies
+  tool_prune_aggressive_threshold_tokens: 800000
+  tool_prune_recent_results: 5              # newest Tool Results always remain raw
   token_source: api_usage             # tokens read from each response's usage field
+  working_memory_mode: append_only    # append_only experiment; set replace for the legacy control group
 
 pricing:
-  # Current DeepSeek plan, CNY per 1M tokens. Other providers remain unpriced
-  # until their rates are explicitly configured.
+  # Official DeepSeek rates, CNY per 1M tokens.
   deepseek_cny_per_million:
-    cached_input: 0.025
-    uncached_input: 3.0
-    output: 6.0
+    deepseek-v4-flash:
+      cached_input: 0.02
+      uncached_input: 1.0
+      output: 2.0
+    deepseek-v4-pro:
+      cached_input: 0.025
+      uncached_input: 3.0
+      output: 6.0
+  deepseek_peak:
+    enabled: true
+    timezone: Asia/Shanghai
+    multiplier: 2.0
+    windows:
+      - ["09:00", "12:00"]
+      - ["14:00", "18:00"]
 
 web_search:
   # auto uses Brave when BRAVE_SEARCH_API_KEY exists, otherwise DuckDuckGo HTML.
   provider: auto
   max_results: 8
   timeout_seconds: 20
+  # Experiment anti-leakage policy: September 2025 and later are unavailable.
+  # Pages without a machine-readable publication date are conservatively blocked.
+  content_cutoff: "2025-09-01"
+  require_verified_publication_date: true
+
+vision:
+  enabled: true
+  provider: moonshot
+  model: kimi-k3
+  base_url: https://api.moonshot.cn/v1
+  api_key_env: MOONSHOT_API_KEY
+  timeout_seconds: 180
+  # K3 otherwise defaults to a very large output allowance. This cap keeps a
+  # single image inspection predictable while leaving room for formulas/tables.
+  max_completion_tokens: 4096
+  max_image_bytes: 20971520
+  # CNY per 1M tokens. Unknown cache provenance is billed conservatively as miss.
+  pricing_cny_per_million:
+    cached_input: 2.0
+    uncached_input: 20.0
+    output: 100.0
 
 verification:
   enabled: true
@@ -36,6 +77,9 @@ verification:
   provider_config: {}
 
 paper:
+  # Fallback when no competition writing skill has activated its own profile.
+  template: generic
+  page_count_metric: total_pages
   target_pages: 20
   min_pages: 17
   max_pages: 20

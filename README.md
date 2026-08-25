@@ -1,53 +1,90 @@
 # Open Math Model Agent
 
-一个本地优先的数学建模智能体工作台：从题目和材料导入开始，完成问题理解、建模、代码实验、论文写作、独立验证与 PDF 交付。
+**English** | [简体中文](README.zh-CN.md) | [Website](https://mathemodel.com/)
 
-项目采用 Vite + React + TypeScript 构建前端，Python 负责 Agent 编排、文件处理、验证流程、LaTeX 论文生成和上下文审计。默认支持 DeepSeek，也可在设置中切换到 Kimi、MiniMax 或其他兼容 OpenAI Chat Completions 接口的服务。
+Open Math Model Agent is a local-first workspace for mathematical modeling. Give it a problem and supporting materials, and it can analyze the task, build and test models, write a paper, verify the result, and deliver the final PDF.
 
-## 主要功能
+<p align="center">
+  <a href="https://mathemodel.com/"><img src="docs/screenshots/mathemodel-landing.jpg" alt="MATHEMODEL English landing page" width="100%"></a>
+</p>
 
-- AI-native 对话工作区：左侧会话历史、中间 Agent 对话、右侧协作计划/材料/关键决策/交付物/验证结果。
-- 智能意图路由：普通闲聊直接回答；建模任务进入完整工作流。
-- 多格式材料导入：支持 Markdown、文本、PDF、Word、Excel、CSV 和常见图片格式，并规范化为 `problem.md`、`data/` 与 `assets/`。
-- 主 Agent 与 Sub-agent 协作：任务可以并行委派，主 Agent 分批收取已经完成的结果。
-- 工具化研究流程：读取文件、执行代码、管理计划、联网检索、撰写论文、局部编辑论文、向用户提问等。
-- 独立验证闭环：候选结果交给验证 Agent；未通过时返回证据与修改意见，最多验证指定轮数后按配置交付。
-- LaTeX 论文流水线：Tectonic 编译、页数与摘要检查、公式/图表预检，以及最终 PDF 交付。
-- 可中断、可继续的会话：停止后丢弃迟到的 API 结果，并从已持久化的状态继续。
-- Markdown、GFM 表格、数学公式与代码块渲染。
-- 上下文检查后台：单独查看每次模型请求中的系统提示、工作记忆、工具定义、用户输入、工具调用和工具结果。
-- Token 与费用统计：区分缓存输入、非缓存输入和输出 Token；DeepSeek 默认按 `config.yaml` 中的人民币费率估算。
+<p align="center">
+  <img src="docs/screenshots/mathemodel-benchmark.jpg" alt="Harness benchmark and ablation results" width="49%">
+  <img src="docs/screenshots/mathemodel-workspace.jpg" alt="MATHEMODEL workspace" width="49%">
+</p>
 
-## 系统结构
+Try the hosted experience at **[mathemodel.com](https://mathemodel.com/)**, or follow the instructions below to run the complete workspace locally.
+
+## Highlights
+
+- A focused conversational workspace for modeling tasks, materials, decisions, progress, and deliverables.
+- File-based problem intake for PDF, Word, Excel, CSV, Markdown, text, and image materials.
+- Collaboration between a lead Agent and delegated sub-agents for modeling, coding, research, and writing.
+- An independent verification loop that returns evidence and revision requests before delivery.
+- Resumable conversations, bilingual UI, context inspection, and token/cost tracking.
+
+## How it works
 
 ```mermaid
 flowchart LR
-    UI["React 工作台 :8765"] --> API["Dashboard Server"]
-    API --> Router["意图路由"]
-    Router --> Chat["普通对话"]
-    Router --> Lead["主 Agent"]
+    UI["Workspace :8765"] --> API["Dashboard Server"]
+    API --> Lead["Unified Lead Agent"]
+    Lead -->|"ordinary reply"| Chat["General Conversation"]
+    Lead -->|"ingest_problem"| Intake["problem.md / data / assets"]
     Lead <--> Subs["Sub-agents"]
-    Lead --> Tools["代码 / 文件 / 搜索 / 论文工具"]
-    Lead --> Verifier["独立验证 Agent"]
+    Lead --> Tools["Code / Files / Search / Paper Tools"]
+    Lead --> Verifier["Independent Verifier"]
     Verifier -->|"REVISE"| Lead
-    Verifier -->|"PASS"| Delivery["LaTeX / PDF 交付"]
-    API --> Workspace["workspace/ 会话状态与产物"]
+    Verifier -->|"PASS"| Delivery["LaTeX / PDF Delivery"]
+    API --> Workspace["workspace/ State and Artifacts"]
     Lead --> Recorder["Context Recorder"]
     Subs --> Recorder
     Verifier --> Recorder
     Recorder --> Inspector["Context Inspector :8766"]
 ```
 
-## 环境要求
+## Core Agent features
 
-- Python 3.11 或更高版本
-- Docker Desktop，用于隔离执行 Agent 生成的代码
-- [Tectonic](https://tectonic-typesetting.github.io/)，用于把 LaTeX 论文编译为 PDF
-- Node.js 20+ 与 pnpm，仅在修改前端源码时需要；仓库已经包含编译后的静态页面
+### Asynchronous Lead/Sub-agent collaboration
 
-## 快速开始
+`spawn_subagent` starts a bounded task in the background and returns a handle immediately. Independent modeling, coding, search, or simulation tasks can therefore run concurrently in isolated Agent contexts while sharing only durable files such as `results/`, `figures/`, and `src/` with the Lead Agent.
 
-### 1. 克隆与安装
+The Lead Agent does not have to wait for the slowest worker. `collect_subagent_results(mode="first_completed")` returns as soon as one new result is available and also reports every Sub-agent still running together with its assigned task. The Lead can inspect the first result, update the plan, or continue integration while the remaining workers run. `all_completed` is required only before final synthesis and delivery. This keeps Sub-agent debugging traces out of the Lead context while preserving asynchronous progress.
+
+### Durable Todo plan and decision state
+
+The modeling plan is a structured Todo list stored in `plan.json`, with a human-readable `plan.md` mirror for the dashboard. `plan_write` creates or restructures the task list; `set_task_status` updates one task atomically instead of forcing the Agent to rewrite the entire plan. Important assumptions, abandoned approaches, and decisions are appended to `decisions.md` so they survive context compaction and interruption.
+
+The Plan itself is live mutable state; the model transcript is not rewritten when the Plan changes. Its latest materialized state is propagated through a newly appended Working Memory snapshot.
+
+### Append-only Working Memory protocol
+
+In `append_only` mode, the second system message is an immutable protocol that defines how later memory entries must be interpreted. When the durable Plan, decisions, result index, or figure index changes, the runtime computes a state digest and appends a versioned, complete Working Memory snapshot at the end of the transcript. Existing protocol and snapshot messages are never edited, and no snapshot is inserted inside an unfinished Tool Call/Tool Result batch.
+
+Each snapshot records its epoch, version, SHA-256 digest, and the version it supersedes. Compaction starts a new epoch and materializes one fresh snapshot. This design makes interruption recovery deterministic and keeps the early request prefix stable for provider-side caching. In the current 2023 MCM A experiment, append-only memory reached an 88.8% cache-hit rate versus 79.6% for replace-in-place memory. The full contract is documented in [`docs/working-memory-protocol.md`](docs/working-memory-protocol.md).
+
+### Long-running tool liveness and failure recovery
+
+Model requests and tools emit durable heartbeat events every 30 seconds without adding heartbeat text to the model context. The dashboard uses a five-minute stale threshold, but a live worker lease or recent heartbeat keeps a legitimate multi-hour computation in the `running` state.
+
+`run_code` supports a wall-clock limit of up to 7,200 seconds. Docker enforces the limit inside the container, while the host polls the process and shared cancellation flag every 0.25 seconds. A timeout or user stop kills both the host process group and the named container. The result is returned as a normal Tool Result with `exit_code`, `timed_out`, duration, stdout/stderr tail, and a path to the full log; a tool timeout does not mark the entire conversation as failed, so the Lead Agent can diagnose the failure and choose another action. Uncaught tool exceptions are likewise converted into explicit error observations instead of crashing the Agent loop.
+
+The session is persisted before each model request and after tool-result batches. If the dashboard process or machine fails completely, the in-flight Agent cannot continue automatically, but startup reconciliation marks the lost worker explicitly, removes only Docker containers labelled as belonging to that conversation, and preserves the last durable session boundary for a later continuation.
+
+### Evidence-oriented paper delivery and independent verification
+
+Computed claims are written to structured `results/` files, final reproducible code is kept under `src/`, and paper figures and LaTeX remain linked to those artifacts. Before delivery, an independent Verifier can inspect the original problem, source, numerical outputs, figures, and candidate paper. A failed verdict returns structured evidence and repair instructions to the Lead Agent for another revision instead of silently accepting self-evaluation.
+
+## Requirements
+
+- Python 3.11 or later
+- Docker Desktop, used to isolate Agent-generated code
+- [Tectonic](https://tectonic-typesetting.github.io/), used to compile LaTeX papers into PDF
+- Node.js 20+ and pnpm only when modifying the frontend; compiled static assets are included in the repository
+
+## Quick start
+
+### 1. Clone and install
 
 ```bash
 git clone git@github.com:patrlean/open-math-model-agent.git
@@ -59,64 +96,75 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-在 `.env` 中至少填写一个模型服务的 API Key。默认配置使用 DeepSeek：
+Add at least one model provider API key to `.env`. DeepSeek is the default provider:
 
 ```dotenv
 DEEPSEEK_API_KEY=your_api_key
 ```
 
-### 2. 构建代码执行沙箱
+### 2. Build the code sandbox
 
 ```bash
 docker build -t mathmodel-sandbox:latest mathmodel/sandbox
 ```
 
-沙箱默认禁用网络，并对 Agent 运行的建模代码设置资源限制。
+The sandbox disables network access by default and applies resource limits to Agent-generated modeling code.
 
-### 3. 启动主工作台
+### 3. Start the workspace
 
 ```bash
 source .venv/bin/activate
 python -m mathmodel.dashboard.server --port 8765
 ```
 
-打开 [http://127.0.0.1:8765](http://127.0.0.1:8765)。
+Open [http://127.0.0.1:8765](http://127.0.0.1:8765).
 
-### 4. 启动上下文检查后台
+### 4. Start the Context Inspector
 
-在另一个终端运行：
+In another terminal:
 
 ```bash
 source .venv/bin/activate
 python -m mathmodel.context_inspector.server --port 8766
 ```
 
-打开 [http://127.0.0.1:8766](http://127.0.0.1:8766)。该页面会显示模型实际接收的上下文，其中内容按以下类别整理：
+Open [http://127.0.0.1:8766](http://127.0.0.1:8766). It shows the context sent to the model, grouped into:
 
 1. System Prompt
-2. Working Memory
+2. Working Memory Protocol and versioned snapshots
 3. Available Tool Definitions
 4. User Input
 5. Assistant Response / Tool Call / Tool Result
 
-上下文日志可能包含完整题目、用户输入、工具参数和模型回复，请把它当作敏感数据，不要公开分享。
+Context logs may contain complete problems, user input, tool arguments, and model responses. Treat them as sensitive data and do not share them publicly.
 
-## 模型服务
+The default `append_only` Working Memory mode preserves an immutable protocol
+and appends a full snapshot only when durable state changes. See
+[`docs/working-memory-protocol.md`](docs/working-memory-protocol.md); set
+`context.working_memory_mode: replace` for the legacy comparison group.
 
-可以在网页左下角的“设置”中更换服务商、模型、Base URL 和 API Key。密钥写入本机 `.env`，服务商、模型和 Base URL 元数据写入 `.provider-settings.json`；这两个本地配置均不会提交到 Git。
+## Model providers
 
-| 服务商 | 默认模型 | 默认 Base URL | 环境变量 |
+Use **Settings** in the lower-left corner to configure the provider, Base URL, and API key. For DeepSeek, choose Flash/Pro and Low/High/Max thinking effort beside the composer send button. Keys are stored in `.env`; provider metadata is stored in `.provider-settings.json`. Neither file is committed to Git.
+
+| Provider | Default model | Default Base URL | Environment variable |
 | --- | --- | --- | --- |
-| DeepSeek | `deepseek-v4-pro` | `https://api.deepseek.com` | `DEEPSEEK_API_KEY` |
+| DeepSeek | `deepseek-v4-flash` (default) / `deepseek-v4-pro` | `https://api.deepseek.com` | `DEEPSEEK_API_KEY` |
 | Kimi | `kimi-k2.6` | `https://api.moonshot.cn/v1` | `KIMI_API_KEY` |
 | MiniMax | `MiniMax-M2.7` | `https://api.minimaxi.com/v1` | `MINIMAX_API_KEY` |
-| OpenAI-compatible | 自定义 | 自定义 | `OPENAI_COMPATIBLE_API_KEY` |
+| OpenAI-compatible | Custom | Custom | `OPENAI_COMPATIBLE_API_KEY` |
 
-联网检索默认优先使用 Brave Search；配置 `BRAVE_SEARCH_API_KEY` 后启用。未配置时会回退到 DuckDuckGo HTML 搜索。
+Web search uses Brave Search when `BRAVE_SEARCH_API_KEY` is configured and falls back to DuckDuckGo HTML search otherwise.
 
-## 输入材料与会话产物
+Image materials are inspected through the lead Agent's `describe_image` tool,
+which uses `kimi-k3`. Configure `MOONSHOT_API_KEY`; its cache-hit input,
+cache-miss input, output tokens, and CNY cost are included in the conversation
+usage and revision budget. Tool model and limits are configured under `vision`
+in `config.yaml`.
 
-建模任务开始后，上传材料会被整理为统一的工作区：
+## Inputs and conversation artifacts
+
+Each modeling conversation gets an isolated workspace:
 
 ```text
 workspace/<conversation-id>/
@@ -133,54 +181,132 @@ workspace/<conversation-id>/
 └── session_state.json
 ```
 
-- PDF 中的文字会被提取，内嵌图片会保存到 `assets/`。
-- Excel 工作表会规范化为 CSV，供 Agent 和代码沙箱读取。
-- 图片材料目前会原样保存，但文字模型不会自动理解图片内容；需要 OCR 或视觉模型时应增加对应处理器。
-- `workspace/` 包含本地会话、原始材料和生成产物，已在 `.gitignore` 中排除。
+- Text is extracted from PDFs, and embedded images are saved to `assets/`.
+- Excel worksheets are normalized to CSV for the Agent and code sandbox.
+- Image materials are preserved as-is, but a text-only model cannot interpret them automatically. Add OCR or a vision processor when needed.
+- `workspace/` contains local conversations, source materials, and generated artifacts, and is excluded by `.gitignore`.
 
-## 配置
+## Configuration
 
-全局默认值位于 [`config.yaml`](config.yaml)：
+Global defaults live in [`config.yaml`](config.yaml):
 
-| 配置块 | 用途 |
+| Section | Purpose |
 | --- | --- |
-| `provider` / `model` / `base_url` | 默认模型服务 |
-| `context` | 上下文压缩阈值与 Token 来源 |
-| `pricing` | 缓存输入、非缓存输入和输出的单价 |
-| `web_search` | 搜索提供方、结果数量与超时 |
-| `verification` | 是否验证、最大验证轮数、验证与修订步数 |
-| `paper` | 目标页数、可接受页数、摘要和公式要求 |
-| `sandbox` | 代码执行后端 |
+| `provider` / `model` / `base_url` | Default model service |
+| `context` | Context compression thresholds and token sources |
+| `pricing` | Cached input, uncached input, and output token prices |
+| `web_search` | Search provider, result count, and timeout |
+| `verification` | Verification toggle, attempt limit, and verification/revision step limits |
+| `paper` | Target pages, accepted page range, abstract, and equation requirements |
+| `sandbox` | Code execution backend |
 
-默认论文目标为 20 页，可接受范围为 17–20 页。页面设置中的会话级参数会覆盖全局默认值。
+The default paper target is 20 pages, with 17–20 pages accepted. Conversation-level settings in the UI override global defaults.
 
-## 前端开发
+## Frontend development
 
-前端源码位于 `mathmodel/dashboard/frontend/`，包含主工作台和 Context Inspector 两个入口：
+The frontend source is in `mathmodel/dashboard/frontend/` and includes the main workspace and Context Inspector entry points:
 
 ```bash
 corepack enable
 pnpm --dir mathmodel/dashboard/frontend install --frozen-lockfile
 pnpm --dir mathmodel/dashboard/frontend build
+pnpm --dir mathmodel/dashboard/frontend exec vite build --config vite.experiment.config.ts
 ```
 
-构建产物会写入 `mathmodel/dashboard/static/`，Python 服务直接提供这些静态文件。
+The first build produces the main workspace and Context Inspector; the second produces the standalone Experimental Inspector. Both write static assets to `mathmodel/dashboard/static/`, which are served directly by the Python servers.
 
-本地开发服务器：
+Start the frontend development server with:
 
 ```bash
 pnpm --dir mathmodel/dashboard/frontend dev
 ```
 
-## 检查与回归测试
+## Standalone benchmark experiments
 
-项目在 `scripts/` 中保留了可直接运行的回归检查；它们是项目测试的一部分，不应加入 `.gitignore`。
+The benchmark runner does not require `localhost:8765`. Each submission freezes the current backend source, resolved runtime configuration, and benchmark inputs, so an existing run keeps using its own version while a newer Agent revision starts immediately in parallel.
+
+```bash
+./.venv/bin/python -m mathmodel.experiment cases
+./.venv/bin/python -m mathmodel.experiment submit --label before-prompt-change
+./.venv/bin/python -m mathmodel.experiment submit --label after-prompt-change
+./.venv/bin/python -m mathmodel.experiment list
+./.venv/bin/python -m mathmodel.experiment status <experiment-id>
+./.venv/bin/python -m mathmodel.experiment logs <experiment-id> --case 2023MCM_A-run-1 --follow
+```
+
+By default, every case under `benchmark-v1/*/problem/` runs twice as two fully independent and concurrent units named `<case>-run-1` and `<case>-run-2`, each with its own workspace, process, logs, and artifacts. The default two-worker pool runs both repetitions of the first case together, then both repetitions of the next case. Experiments use 200 main-Agent steps and keep built-in verification disabled for later external scoring. Add `--with-verification` to include it. Outputs live under `experiments/<experiment-id>/`; `manifest.json` records the Git revision, dirty-tree flag, source hash, model settings, and run states. An optional case-level `task.md` overrides the default unattended benchmark instruction.
+
+Use `--config path/to/config.yaml` to freeze an alternate experiment configuration, `--max-workers 1` to run units sequentially, or `--repetitions N` to override the default two runs per case.
+
+## Experiments and ablations
+
+The project currently includes 11 completed, externally scorable harness experiments. The main ablation axes are Working Memory placement, verification, context-compaction structure, preservation of reasoning traces, externalization of tool results, and checkpoint-based pruning.
+
+All scores below are for **2023 MCM Problem A only**. They were transcribed from the project author's independent evaluator records rather than generated by `manifest.json`. An experiment score is the mean of its two independently generated papers after first averaging repeated evaluator judgments for each paper.
+
+| Experiment | Structure changed or tested | Result status | 2023 MCM A score |
+| --- | --- | --- | ---: |
+| Initial Agent baseline | Initial end-to-end harness, before the later Working Memory and context-policy experiments | Complete | 73.75 |
+| Append-only baseline | Updated Lead/Sub-agent harness with append-only Working Memory and no independent verification | Complete | 92.42 |
+| Working Memory replace | Replaced the mutable Working Memory message in place instead of appending versioned snapshots | Complete | 93.00 |
+| With verification | Enabled the independent verification-and-revision loop on top of append-only Working Memory | Complete | 90.83 |
+| Monolithic summary, 256k | At 256k context tokens, summarized the old conversation as one block and retained the latest 10 messages | Complete | 86.50 |
+| Split user/Agent summary, 256k | Preserved earlier user messages verbatim while summarizing older Agent reasoning and tool activity separately | Complete | 83.00 |
+| Incremental summary with preserved thinking | Appended delta summaries but retained historical reasoning/tool traces instead of removing them | Complete | 83.50 |
+| Incremental summary | Appended summaries of only the newly compacted trace while retaining the latest 10 messages | Complete | 82.75 |
+| Externalized tool results | Moved large historical Tool Results to workspace files and kept references plus short previews in context | Complete | 82.00 |
+| Full-context control | Raised the compaction threshold to 1M tokens to approximate an uncompressed-history control | Complete | 66.50 |
+| Checkpoint + tool pruning V2 | Pruned old Tool Results by recoverability at 166.4k/204.8k tokens, then generated an execution checkpoint at 256k while retaining the latest 10 messages | Complete | 88.75 |
+
+<details>
+<summary>Raw independent-evaluator records</summary>
+
+| Experiment | Paper/run 1 judgments | Paper/run 2 judgments | Experiment mean |
+| --- | --- | --- | ---: |
+| Initial Agent baseline | 77, 83 | 63, 70.5, 69 | 73.75 |
+| Append-only baseline | 88, 91.5, 95 | 95, 92, 93 | 92.42 |
+| Working Memory replace | 94 | 92 | 93.00 |
+| With verification | 95, 89, 88.5 | 93, 92.5, 87 | 90.83 |
+| Monolithic summary, 256k | 86 | 87 | 86.50 |
+| Split user/Agent summary, 256k | 84 | 82 | 83.00 |
+| Incremental summary with preserved thinking | 84 | 83 | 83.50 |
+| Incremental summary | 82, 91.5 | 75, 82.5 | 82.75 |
+| Externalized tool results | 83 | 81 | 82.00 |
+| Full-context control | 57 | 76 | 66.50 |
+| Checkpoint + tool pruning V2 | 91 | 86.5 | 88.75 |
+
+</details>
+
+### Findings from the current 2023 benchmark
+
+- Repeated judgments of the same paper have a pooled standard deviation of **3.9 points** (coefficient of variation: **4.6%**). The 11 experiment means have a standard deviation of **8.0 points** (coefficient of variation: **9.6%**), so evaluator noise is material but smaller than the observed spread between harness configurations.
+- Append-only Working Memory reached an **88.8% cache-hit rate**, 9.2 percentage points above replace-in-place Working Memory, while quality remained effectively unchanged (92.42 versus 93.00).
+- Checkpoint + tool pruning V2 reduced cumulative API tokens across the two 2023 runs from 63.70M for the strong append-only baseline to 34.96M, a **45.1% reduction**, while its evaluator score was 3.67 points lower (approximately **4.0%** relative).
+- Preserving old reasoning traces defeated the purpose of compaction in this workload: the strategy accumulated 78.26M tokens, recorded 149 compactions, and achieved only a 27.3% cache-hit rate.
+- Independent verification should not yet be credited with a causal score improvement: its two papers both averaged 90.83, showing stable 90+ quality, but the mean was 1.58 points below the no-verification append-only baseline. More benchmark cases and repetitions are needed to measure its effect reliably.
+
+These comparisons are exploratory rather than a final leaderboard. Most cells contain only two generated papers, several papers were judged repeatedly while others were judged once, and historical source snapshots changed between some groups. The frozen source hash and configuration in each local `experiments/<experiment-id>/manifest.json` remain the authoritative provenance records. Experiment workspaces and model logs may contain benchmark materials and are intentionally not published with the repository.
+
+Start the standalone, read-only Experimental Inspector and open [http://127.0.0.1:8767](http://127.0.0.1:8767):
+
+```bash
+./.venv/bin/python -m mathmodel.experimental_inspector.server --port 8767
+```
+
+It live-reads experiment and case status, Agent events, tool calls, usage, plans, decisions, artifacts, and console logs. Context requests are grouped into separate Main Agent and Sub-agent views with per-Agent request and token totals. The Inspector never starts, stops, or mutates experiments.
+
+## Checks and regression tests
+
+Runnable regression checks live in `scripts/` and are part of the project test suite. Do not add this directory to `.gitignore`.
 
 ```bash
 python -m compileall -q mathmodel scripts
 python -m scripts.check_ingest
 python -m scripts.check_context
 python -m scripts.check_context_inspector
+python -m scripts.check_competition_paper_profiles
+python -m scripts.check_experiment_runner
+python -m scripts.check_experimental_inspector
 python -m scripts.check_dashboard_conversations
 python -m scripts.check_dashboard_interrupt_resume
 python -m scripts.check_edit_paragraph
@@ -192,16 +318,35 @@ python -m scripts.check_sandbox
 pnpm --dir mathmodel/dashboard/frontend build
 ```
 
-部分检查需要 Docker、Tectonic 或有效的模型 API Key。
+Some checks require Docker, Tectonic, or a valid model API key.
 
-## 安全说明
+## Changelog
 
-- `.env`、本地服务商设置、运行工作区、日志、临时文件和前端依赖不会提交到 Git。
-- 不要把 API Key 写入 `config.yaml`、源码、README 或测试文件。
-- Dashboard 与 Context Inspector 默认只应绑定本机地址；当前项目没有面向公网部署所需的身份认证。
-- Docker 沙箱默认禁用网络，但仍应审查资源限制后再用于不受信任的公开输入。
-- 费用显示是基于 API 返回的 usage 字段与本地费率配置进行的估算，不等同于服务商账单。
+### Unreleased
+
+- Added English and Chinese interfaces with English as the default language.
+- Added bilingual project documentation and language links between README files.
+- Licensed the project under the Apache License 2.0.
+- Added persisted competition page profiles: CUMCM targets 20 pages, while MCM/ICM targets 25 pages and accepts 24–25.
+- Documented 11 completed harness experiments, the 2023 MCM A evaluator records, and the current context-management ablation findings.
+- Documented asynchronous Sub-agent collection, durable planning, append-only Working Memory, and long-running tool recovery as first-class Harness features.
+
+### 2026-07-30
+
+- Added project documentation and improved the context timeline display.
+
+### 2026-07-29
+
+- Published the initial Open Math Model Agent workspace.
+
+## Security notes
+
+- `.env`, local provider settings, runtime workspaces, logs, temporary files, and frontend dependencies are not committed to Git.
+- Never put API keys in `config.yaml`, source code, README files, or tests.
+- The Dashboard and Context Inspector should only bind to localhost by default. The project does not include authentication for public deployment.
+- The Docker sandbox disables network access by default, but review its resource limits before accepting untrusted public input.
+- Displayed costs are estimates based on API usage fields and local pricing configuration, not provider invoices.
 
 ## License
 
-仓库目前尚未添加开源许可证。在正式添加 `LICENSE` 前，请不要将代码视为已获授权的开源软件。
+Licensed under the [Apache License 2.0](LICENSE). You may use, modify, and distribute this project, including for commercial purposes, subject to the terms of the license.
