@@ -64,6 +64,15 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         cfg = load_config()
+        assert cfg["web_search"]["content_cutoff"] is None
+        assert cfg["web_search"]["require_verified_publication_date"] is False
+        # Production has live search enabled. The cutoff remains available only
+        # when a benchmark or historical evaluation opts in explicitly.
+        cfg["web_search"] = {
+            **cfg["web_search"],
+            "content_cutoff": "2025-09-01",
+            "require_verified_publication_date": True,
+        }
         cfg["sandbox"] = "local"
         ctx = ToolContext(
             workdir=Path(tmp),

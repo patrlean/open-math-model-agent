@@ -42,10 +42,10 @@ web_search:
   provider: auto
   max_results: 8
   timeout_seconds: 20
-  # Experiment anti-leakage policy: September 2025 and later are unavailable.
-  # Pages without a machine-readable publication date are conservatively blocked.
-  content_cutoff: "2025-09-01"
-  require_verified_publication_date: true
+  # Production workspaces search the live web without a benchmark date cutoff.
+  # Benchmark and historical evaluation runs must opt in to a cutoff explicitly.
+  content_cutoff: null
+  require_verified_publication_date: false
 
 vision:
   enabled: true
