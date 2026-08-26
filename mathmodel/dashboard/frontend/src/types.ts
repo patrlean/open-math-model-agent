@@ -37,6 +37,7 @@ export interface VerificationUsage {
 
 export interface AgentEvent {
   kind: string
+  id?: string
   ts?: number
   t?: number
   subagent?: number
@@ -66,6 +67,18 @@ export interface AgentEvent {
   summary?: string
   issues?: VerificationIssue[]
   verification_usage?: VerificationUsage
+  question_kind?: 'question' | 'change_confirmation'
+  title?: string
+  question?: string
+  impacts?: PendingQuestion['impacts']
+  budget?: PendingQuestion['budget']
+  options?: QuestionOption[]
+  allow_custom?: boolean
+  asked_at?: number
+  change_request_id?: string | null
+  answered?: boolean
+  selected_option_id?: string | null
+  change_action?: string | null
 }
 
 export interface QuestionOption {

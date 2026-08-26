@@ -373,6 +373,22 @@ html, body, #root { height: 100%; overflow: hidden; }
 .change-confirmation .pending-question-option.option-cancel { flex: 0 0 auto; justify-content: center; background: transparent; border-color: transparent; }
 .change-confirmation .pending-question-option:hover:not(:disabled) { background: #eef1f8; border-color: #2559b8; }
 .change-confirmation .pending-question-option.option-confirm:hover:not(:disabled) { background: #2559b8; }
+.pending-question-card.is-resolved { background: #f7f8f4; border-color: #d9dfd3; }
+.pending-question-card.is-resolved .pending-question-heading { color: #55715b; }
+.pending-question-card.is-resolved .pending-question-heading .branch-icon { color: #fff; background: #55715b; }
+.pending-question-card.is-resolved .pending-question-option:disabled,
+.pending-question-card.is-closed .pending-question-option:disabled { cursor: default; }
+.pending-question-card.is-resolved .pending-question-option:not(.is-selected) { opacity: .5; }
+.pending-question-card .pending-question-option.is-selected { color: #fff; background: #343b34; border-color: #343b34; opacity: 1; box-shadow: 0 0 0 2px rgba(74, 101, 78, .14); }
+.pending-question-card .pending-question-option.is-selected strong,
+.pending-question-card .pending-question-option.is-selected span { color: #fff; }
+.pending-question-card.change-confirmation.is-resolved .pending-question-option.option-confirm:not(.is-selected) { color: #3a3a35; background: #fff; border-color: #ecdfc0; }
+.pending-question-card.change-confirmation.is-resolved .pending-question-option.option-confirm:not(.is-selected) strong { color: #3a3a35; }
+.pending-question-card.change-confirmation.is-resolved .pending-question-option.option-confirm:not(.is-selected) span { color: #8b8b84; }
+.pending-question-answer { display: grid; grid-template-columns: 24px minmax(0, 1fr); column-gap: 9px; align-items: center; margin-top: 13px; padding: 10px 12px; color: #49634e; background: #e8f0e8; border: 1px solid #d4e2d5; border-radius: 10px; }
+.pending-question-answer > span { grid-row: 1 / 3; display: grid; width: 22px; height: 22px; place-items: center; color: #fff; background: #55715b; border-radius: 50%; font-size: 11px; font-weight: 750; }
+.pending-question-answer small { color: #718276; font-size: 9px; }
+.pending-question-answer strong { color: #405846; font-size: 11.5px; font-weight: 680; }
 
 .timeline-notice.verification { width: fit-content; max-width: min(640px, 90%); margin: 2px auto 12px; padding: 7px 12px; color: #6d706b; background: #f1f2ef; border-radius: 999px; line-height: 1.5; }
 .timeline-notice.verification.checking { color: #65759a; background: #eef1f7; }

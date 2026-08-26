@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { AgentEvent, RunDetail, VerificationIssue } from '../types'
+import type { AgentEvent, PendingQuestion, RunDetail, VerificationIssue } from '../types'
 import { clock, eventToolPreview, prettyJson } from '../helpers'
 import agentPetClosedUrl from '../assets/agent-pet-closed-v3.png'
 import agentPetOpenUrl from '../assets/agent-pet-open-v3.png'
@@ -15,7 +15,7 @@ interface ToolCall {
 }
 
 interface Message {
-  kind: 'assistant' | 'compaction' | 'verification' | 'done' | 'stopped' | 'user'
+  kind: 'assistant' | 'compaction' | 'verification' | 'done' | 'stopped' | 'user' | 'question'
   text?: string
   reasoning?: string
   ts?: number
@@ -27,6 +27,9 @@ interface Message {
   issues?: VerificationIssue[]
   calls?: ToolCall[]
   rolling?: boolean
+  question?: PendingQuestion
+  questionResolved?: boolean
+  selectedOptionId?: string | null
 }
 
 function SequentialLoadingRing({ className = '' }: { className?: string }) {
@@ -156,6 +159,24 @@ function DraftLoadingRing() {
   )
 }
 
+function questionFromEvent(event: AgentEvent): PendingQuestion | null {
+  if (!['question', 'change_confirmation'].includes(event.kind)) return null
+  if (!event.id || !event.question) return null
+  return {
+    id: event.id,
+    kind: event.kind === 'change_confirmation' ? 'change_confirmation' : 'question',
+    title: event.title,
+    summary: event.summary,
+    question: event.question,
+    impacts: event.impacts,
+    budget: event.budget,
+    options: event.options ?? [],
+    allow_custom: event.allow_custom ?? event.kind === 'question',
+    asked_at: event.asked_at ?? event.ts ?? 0,
+    change_request_id: event.change_request_id,
+  }
+}
+
 function buildMessages(events: AgentEvent[], language: Language): Message[] {
   const en = language === 'en'
   const messages: Message[] = []
@@ -181,6 +202,28 @@ function buildMessages(events: AgentEvent[], language: Language): Message[] {
       continue
     }
     if (event.subagent != null) continue
+    const recordedQuestion = questionFromEvent(event)
+    if (recordedQuestion) {
+      closeRollingWindow()
+      activeAssistant = undefined
+      messages.push({
+        kind: 'question',
+        ts: recordedQuestion.asked_at,
+        question: recordedQuestion,
+        questionResolved: false,
+      })
+      continue
+    }
+    if (event.kind === 'ask_resolved' && event.id) {
+      const questionMessage = [...messages].reverse().find(
+        (message) => message.kind === 'question' && message.question?.id === event.id,
+      )
+      if (questionMessage) {
+        questionMessage.questionResolved = event.answered === true
+        questionMessage.selectedOptionId = event.selected_option_id
+      }
+      continue
+    }
     if (event.kind === 'assistant') {
       const assistant: Message = {
         kind: 'assistant',
@@ -190,7 +233,7 @@ function buildMessages(events: AgentEvent[], language: Language): Message[] {
         step: event.step,
         context: event.context_tokens,
         calls: (event.tool_calls ?? [])
-          .filter(([name]) => name !== 'spawn_subagent')
+          .filter(([name]) => name !== 'spawn_subagent' && name !== 'ask_user')
           .map(([name, args]) => ({ name, args })),
       }
       const hasResponse = Boolean(assistant.text?.trim())
@@ -219,7 +262,7 @@ function buildMessages(events: AgentEvent[], language: Language): Message[] {
         assistant.rolling = true
         rollingAssistant = assistant
       }
-    } else if (event.kind === 'tool_result' && event.name !== 'spawn_subagent') {
+    } else if (event.kind === 'tool_result' && !['spawn_subagent', 'ask_user'].includes(event.name ?? '')) {
       const call = activeAssistant?.calls?.find((item) => item.result == null)
       if (call) call.result = event.observation
       else activeAssistant?.calls?.push({ name: event.name ?? 'tool', args: '', result: event.observation })
@@ -353,23 +396,43 @@ function AssistantMessage({ message, runStatus }: { message: Message; runStatus:
   )
 }
 
-function PendingQuestionCard({ runId, question }: { runId: string; question: NonNullable<RunDetail['pending_question']> }) {
+function PendingQuestionCard({
+  runId,
+  question,
+  active,
+  resolved = false,
+  selectedOptionId = null,
+}: {
+  runId: string
+  question: PendingQuestion
+  active: boolean
+  resolved?: boolean
+  selectedOptionId?: string | null
+}) {
   const { language } = useLanguage()
   const en = language === 'en'
   const [customText, setCustomText] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [optimisticOptionId, setOptimisticOptionId] = useState<string | null>(null)
+  const [optimisticAnswer, setOptimisticAnswer] = useState('')
+  const effectiveOptionId = selectedOptionId ?? optimisticOptionId
+  const answered = resolved || effectiveOptionId != null || Boolean(optimisticAnswer)
+  const canAnswer = active && !answered
+  const selectedOption = question.options.find((option) => option.id === effectiveOptionId)
 
   async function submit(response: { answer?: string; option_id?: string }) {
-    if ((!response.answer?.trim() && !response.option_id) || submitting) return
+    if ((!response.answer?.trim() && !response.option_id) || submitting || !canAnswer) return
     setSubmitting(true)
     setError(null)
     try {
+      const normalizedAnswer = response.answer?.trim()
       await api.answer(runId, {
         ...response,
-        ...(response.answer ? { answer: response.answer.trim() } : {}),
+        ...(normalizedAnswer ? { answer: normalizedAnswer } : {}),
       })
-      setCustomText('')
+      if (response.option_id) setOptimisticOptionId(response.option_id)
+      if (normalizedAnswer) setOptimisticAnswer(normalizedAnswer)
     } catch (caught) {
       setError(caught instanceof Error
         ? caught.message
@@ -380,13 +443,19 @@ function PendingQuestionCard({ runId, question }: { runId: string; question: Non
   }
 
   return (
-    <article className={`pending-question-card ${question.kind === 'change_confirmation' ? 'change-confirmation' : ''}`}>
+    <article className={`pending-question-card ${question.kind === 'change_confirmation' ? 'change-confirmation' : ''}${answered ? ' is-resolved' : ''}${!active && !answered ? ' is-closed' : ''}`}>
       <div className="pending-question-heading">
         <span className="branch-icon">{question.kind === 'change_confirmation' ? '∆' : '?'}</span>
         <strong>{question.kind === 'change_confirmation'
           ? (en ? 'Research amendment' : '研究修订提案')
           : (en ? 'Agent needs your input' : 'Agent 想确认一下')}</strong>
-        {question.kind === 'change_confirmation' && <small>{en ? 'No changes have been applied' : '尚未改动当前版本'}</small>}
+        <small>{answered
+          ? (en ? 'Answered' : '已选择')
+          : !active
+            ? (en ? 'Closed' : '已结束')
+            : question.kind === 'change_confirmation'
+              ? (en ? 'No changes have been applied' : '尚未改动当前版本')
+              : (en ? 'Waiting for your answer' : '等待你的回答')}</small>
       </div>
       {question.title && <h2 className="pending-question-title">{question.title}</h2>}
       {question.summary && <p className="pending-question-summary">{question.summary}</p>}
@@ -415,8 +484,10 @@ function PendingQuestionCard({ runId, question }: { runId: string; question: Non
           {question.options.map((option) => (
             <button
               key={option.id}
-              className={`pending-question-option option-${option.id}`}
-              disabled={submitting}
+              type="button"
+              className={`pending-question-option option-${option.id}${effectiveOptionId === option.id ? ' is-selected' : ''}`}
+              disabled={submitting || !canAnswer}
+              aria-pressed={effectiveOptionId === option.id}
               onClick={() => void submit({ option_id: option.id })}
             >
               <strong>{option.label}</strong>
@@ -438,10 +509,17 @@ function PendingQuestionCard({ runId, question }: { runId: string; question: Non
             value={customText}
             onChange={(event) => setCustomText(event.target.value)}
             placeholder={en ? 'Or enter your own answer…' : '或者，输入你自己的回答…'}
-            disabled={submitting}
+            disabled={submitting || !canAnswer}
           />
-          <button type="submit" disabled={submitting || !customText.trim()}>{en ? 'Send' : '发送'}</button>
+          <button type="submit" disabled={submitting || !canAnswer || !customText.trim()}>{en ? 'Send' : '发送'}</button>
         </form>
+      )}
+      {answered && (
+        <div className="pending-question-answer" role="status">
+          <span aria-hidden="true">✓</span>
+          <small>{en ? 'Your choice' : '你的选择'}</small>
+          <strong>{selectedOption?.label || optimisticAnswer || (en ? 'Answer submitted' : '回答已提交')}</strong>
+        </div>
       )}
       {error && <p className="pending-question-error">{error}</p>}
     </article>
@@ -521,8 +599,9 @@ export function RunTimeline({
   const maxStepsStopped = stoppedByMainAgentMaxSteps(run)
   const canAddSteps = !run.agent_settings
     || run.agent_settings.max_steps + 40 <= run.agent_settings.max_allowed_steps
-  const isChangeProposal = run.status === 'waiting_input'
-    && run.pending_question?.kind === 'change_confirmation'
+  const pendingQuestionIsInTimeline = run.pending_question != null && messages.some(
+    (message) => message.kind === 'question' && message.question?.id === run.pending_question?.id,
+  )
   let latestStoppedMessage = -1
   messages.forEach((message, index) => {
     if (message.kind === 'stopped') latestStoppedMessage = index
@@ -546,15 +625,7 @@ export function RunTimeline({
     </div>
   }
   return (
-    <section className={`timeline${isChangeProposal ? ' change-proposal-timeline' : ''}`}>
-      {isChangeProposal && run.pending_question && <div className="revision-proposal-sheet">
-        <header>
-          <div><span>{en ? 'REVISION PROPOSAL' : '修改提案'}</span><h2>{run.pending_question.title || (en ? 'Model revision' : '模型修改')}</h2></div>
-          <small>V{run.project.current_revision?.number ?? 1} → V{(run.project.current_revision?.number ?? 1) + 1}</small>
-        </header>
-        <p>{en ? 'Review the impact and budget before a new immutable revision is created.' : '确认影响范围和预算后，系统才会创建新的不可变 Revision。'}</p>
-        <PendingQuestionCard runId={run.id} question={run.pending_question} />
-      </div>}
+    <section className="timeline">
       {(initialTask || initialFiles.length > 0) && (
         <article className="task-brief copyable-message user-copyable">
           <span>{en ? 'Your task' : '你的任务'}</span>
@@ -595,6 +666,20 @@ export function RunTimeline({
         </article>
       )}
       {messages.map((message, index) => {
+        if (message.kind === 'question' && message.question) {
+          const active = run.status === 'waiting_input'
+            && run.pending_question?.id === message.question.id
+          return (
+            <PendingQuestionCard
+              key={`question-${message.question.id}`}
+              runId={run.id}
+              question={message.question}
+              active={active}
+              resolved={message.questionResolved}
+              selectedOptionId={message.selectedOptionId}
+            />
+          )
+        }
         if (message.kind === 'assistant') return <AssistantMessage key={index} message={message} runStatus={run.status} />
         if (message.kind === 'compaction') return <div key={index} className="timeline-notice">✦ {en ? 'Context compacted' : '上下文已整理'} · {message.text}</div>
         if (message.kind === 'verification') return <VerificationNotice key={index} message={message} onOpenVerification={onOpenVerification} />
@@ -638,8 +723,12 @@ export function RunTimeline({
           {message.text?.trim() && <div className="message-actions"><CopyMessageButton text={message.text} idleLabel={en ? 'Copy response' : '复制回复'} /></div>}
         </article>
       })}
-      {run.status === 'waiting_input' && run.pending_question && !isChangeProposal && (
-        <PendingQuestionCard runId={run.id} question={run.pending_question} />
+      {run.status === 'waiting_input' && run.pending_question && !pendingQuestionIsInTimeline && (
+        <PendingQuestionCard
+          runId={run.id}
+          question={run.pending_question}
+          active
+        />
       )}
       {run.status === 'running' && <div className="thinking-indicator"><AgentPet isThinking /><span>{en ? 'Agent is thinking' : 'Agent 正在思考'}</span></div>}
     </section>
